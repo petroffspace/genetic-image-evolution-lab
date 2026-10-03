@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/titlecard.jpg" alt="Genetic Image Evolution Lab: breed abstract art by taste, animate it, render up to 8K" width="100%">
+</p>
+
 # Genetic Image Evolution Lab
 
 Genetic Image Evolution Lab is a browser-based studio for growing abstract
