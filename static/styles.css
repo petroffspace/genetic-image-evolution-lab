@@ -1,0 +1,330 @@
+* {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: #1a1a2e;
+    color: #eee;
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    min-height: 100vh;
+    padding: 20px;
+}
+
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 15px;
+}
+
+.header h1 {
+    font-size: 1.5rem;
+    color: #8b5cf6;
+}
+
+.footer-info {
+    font-size: 0.85rem;
+    color: #888;
+    margin-bottom: 20px;
+}
+
+.feature-panel {
+    max-width: 900px;
+    margin: 0 auto 20px;
+    background: #16213e;
+    border-radius: 8px;
+    padding: 12px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 18px;
+    font-size: 0.9rem;
+}
+
+.feature-panel label {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    color: #ccc;
+}
+
+.feature-note {
+    font-weight: normal;
+    font-size: 0.8rem;
+    color: #888;
+    font-style: italic;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 20px;
+    max-width: 900px;
+    margin: 0 auto;
+}
+
+.cell {
+    position: relative;
+    background: #16213e;
+    border-radius: 8px;
+    padding: 10px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+}
+
+.cell-img {
+    width: 100%;
+    aspect-ratio: 4/3;
+    object-fit: cover;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: transform 0.1s, box-shadow 0.2s;
+    background: #000;
+}
+
+.cell-img:hover {
+    transform: scale(1.02);
+    box-shadow: 0 0 15px rgba(139, 92, 246, 0.5);
+}
+
+/* Mutation strength tier of an evolved child (gentle / normal / wild). */
+.strength-badge {
+    position: absolute;
+    top: 16px;
+    left: 16px;
+    padding: 1px 7px;
+    border-radius: 10px;
+    font-size: 0.7rem;
+    letter-spacing: 0.03em;
+    color: #fff;
+    background: rgba(0, 0, 0, 0.55);
+    pointer-events: none;
+}
+.strength-gentle { box-shadow: inset 0 0 0 1px #34d399; }
+.strength-normal { box-shadow: inset 0 0 0 1px #8b5cf6; }
+.strength-wild   { box-shadow: inset 0 0 0 1px #f97316; }
+
+.cell-buttons {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 8px;
+    gap: 5px;
+}
+
+.btn {
+    flex: 1;
+    padding: 6px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    background: #2a3b66;
+    color: #eee;
+    transition: background 0.2s;
+}
+
+.btn:hover {
+    background: #3a4b76;
+}
+
+.btn-locked {
+    background: #dc2626;
+}
+
+.btn-locked:hover {
+    background: #ef4444;
+}
+
+.btn-primary {
+    background: #8b5cf6;
+    color: white;
+    padding: 8px 20px;
+    border: none;
+    border-radius: 6px;
+    font-size: 1rem;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+
+.btn-primary:hover {
+    background: #a78bfa;
+}
+
+.loading-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: rgba(0,0,0,0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 100;
+}
+
+.spinner {
+    width: 50px;
+    height: 50px;
+    border: 5px solid #333;
+    border-top: 5px solid #8b5cf6;
+    border-radius: 50%;
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
+}
+
+/* Animation Studio */
+.animation-studio {
+    background: #1e1e3f;
+    border-radius: 8px;
+    padding: 20px;
+    margin: 20px auto;
+    max-width: 900px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+}
+
+.animation-studio h2 {
+    color: #8b5cf6;
+    margin-bottom: 8px;
+}
+
+.studio-note {
+    font-size: 0.85rem;
+    color: #888;
+    margin-bottom: 20px;
+    font-style: italic;
+}
+
+.form-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 12px;
+    gap: 10px;
+}
+
+.form-row label {
+    width: 140px;
+    color: #ccc;
+    font-size: 0.9rem;
+}
+
+.form-row input[type="number"],
+.form-row input[type="text"],
+.form-row select {
+    flex: 1;
+    padding: 8px;
+    border: 1px solid #3a3a66;
+    border-radius: 4px;
+    background: #16213e;
+    color: #eee;
+    font-size: 0.9rem;
+}
+
+.btn-large {
+    width: 100%;
+    padding: 12px;
+    font-size: 1.1rem;
+    margin-top: 15px;
+}
+
+.progress-container {
+    margin-top: 15px;
+    padding: 15px;
+    background: #0d0d1a;
+    border-radius: 6px;
+}
+
+.progress-container.hidden {
+    display: none;
+}
+
+.result-message {
+    margin-top: 15px;
+    padding: 15px;
+    background: #1a2a4a;
+    border-left: 4px solid #8b5cf6;
+    border-radius: 4px;
+    color: #ccc;
+    white-space: pre-wrap;
+    font-family: monospace;
+    font-size: 0.85rem;
+}
+
+.result-message.success {
+    border-left-color: #22c55e;
+}
+
+.result-message.error {
+    border-left-color: #ef4444;
+}
+
+.result-message.hidden {
+    display: none;
+}
+
+/* Live WxH readout beside the Quality select in the Animation Studio. */
+#anim-size-info {
+    font-weight: bold;
+    color: #8b5cf6;
+    min-width: 90px;
+    display: inline-block;
+}
+
+/* Animation Studio source-cell sequence (2..8 unique cells). */
+.btn-add-source,
+.btn-remove-source {
+    flex: 0 0 auto;
+    padding: 8px 14px;
+}
+
+.btn-remove-source {
+    padding: 8px 10px;
+}
+
+.btn-add-source:disabled,
+.btn-add-source:disabled:hover {
+    opacity: 0.4;
+    cursor: not-allowed;
+    background: #2a3b66;
+}
+
+/* Keeps single-row select widths aligned whether or not a remove button shows. */
+.btn-remove-source.placeholder {
+    visibility: hidden;
+}
+
+#anim-sources-info {
+    color: #888;
+    font-size: 0.85rem;
+}
+
+/* Live motion panel (Animation Studio). */
+.motion-panel {
+    border-left: 2px solid #3a3a66;
+    padding-left: 10px;
+    margin: 4px 0 12px;
+}
+.motion-presets {
+    display: flex;
+    flex: 1;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.motion-presets .btn {
+    flex: 0 1 auto;
+    padding: 5px 10px;
+}
+.motion-panel input[type="range"] {
+    flex: 1;
+}
+.motion-val {
+    min-width: 32px;
+    color: #8b5cf6;
+    font-weight: bold;
+}

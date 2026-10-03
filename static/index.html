@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Genetic Image Evolution Lab</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <div class="header">
+        <h1>Genetic Image Evolution Lab</h1>
+        <button id="generate-btn" class="btn-primary">Generate All</button>
+    </div>
+    <div class="footer-info">
+        Click image: evolve (children run gentle → wild, top to bottom) · 🔒/🔓: Lock · 📤: Upload & reverse engineer · 📂: Load params · 🧬: Save params · 🖼️: Save image · ↩️: Undo
+    </div>
+        <div class="feature-panel">
+            <strong>Renderer features</strong> <span class="feature-note">(apply to newly generated images only)</span>
+            <label><input type="checkbox" id="feat-transform" checked> Transforms</label>
+            <label><input type="checkbox" id="feat-relief" checked> Relief lighting</label>
+            <label><input type="checkbox" id="feat-spikes" checked> Spectral spikes</label>
+            <label><input type="checkbox" id="feat-chroma" checked> Chroma modulation</label>
+            <label><input type="checkbox" id="feat-cone" checked> Directional streaks</label>
+            <label><input type="checkbox" id="feat-domain_warp" checked> Domain warp (marble)</label>
+            <label><input type="checkbox" id="feat-symmetry" checked> Radial symmetry</label>
+            <label><input type="checkbox" id="feat-anchor_palette" checked> Anchor palettes</label>
+            <label><input type="checkbox" id="feat-lch_palette" checked> OKLCH palettes</label>
+            <label><input type="checkbox" id="feat-layers" checked> Two-layer composition</label>
+            <label><input type="checkbox" id="feat-cellular" checked> Cellular (Worley)</label>
+            <label><input type="checkbox" id="feat-lic" checked> Brush strokes (LIC)</label>
+            <label><input type="checkbox" id="feat-rd" checked> Reaction-diffusion</label>
+        </div>
+
+        <div id="grid" class="grid"></div>
+
+    <!-- Animation Studio Section -->
+    <div class="animation-studio">
+        <h2>🎬 Animation Studio</h2>
+        <p class="studio-note">Render frame sequences for post-production editing</p>
+        
+        <div id="anim-sources"></div>
+        <div class="form-row">
+            <label></label>
+            <button id="add-source-btn" type="button" class="btn btn-add-source">+ Add Source Cell</button>
+            <span id="anim-sources-info"></span>
+        </div>
+        <div class="form-row">
+            <label for="anim-hold" title="Each cell plays its own live motion for this many frames before morphing to the next. With a single cell this is the whole (seamlessly looping) clip. 0 = morph straight from cell to cell.">Frames per cell:</label>
+            <input type="number" id="anim-hold" value="96" min="0" max="5000">
+            <span class="feature-note">each cell animates on its own (0 = no hold)</span>
+        </div>
+        <div class="form-row">
+            <label for="anim-trans" title="Frames spent morphing from one cell to the next (the easing applies here). 0 = hard cut.">Frames per transition:</label>
+            <input type="number" id="anim-trans" value="72" min="0" max="5000">
+            <span id="anim-total-info" class="feature-note"></span>
+        </div>
+        <div class="motion-panel">
+            <div class="form-row">
+                <label title="How each cell image moves on its own. Every motion completes whole cycles per cell hold, so a single-cell clip loops seamlessly.">Live motion:</label>
+                <div class="motion-presets">
+                    <button type="button" class="btn" data-preset="still">Still</button>
+                    <button type="button" class="btn" data-preset="gentle">Gentle</button>
+                    <button type="button" class="btn" data-preset="flowing">Flowing</button>
+                    <button type="button" class="btn" data-preset="psychedelic">Psychedelic</button>
+                </div>
+            </div>
+            <div class="form-row">
+                <label for="motion-flow" title="The texture churns in place: fine detail boils faster than large shapes. Reaction-diffusion cells skip flow (it would flicker).">Flow:</label>
+                <input type="range" id="motion-flow" min="0" max="3" step="0.25" value="0.5">
+                <span id="motion-flow-val" class="motion-val">0.5</span>
+            </div>
+            <div class="form-row">
+                <label for="motion-drift" title="The image glides through its endlessly repeating texture (symmetric images become a moving kaleidoscope). Speed = texture widths traveled per hold.">Drift:</label>
+                <select id="motion-drift">
+                    <option value="0">Off</option>
+                    <option value="1" selected>Slow (1 width per hold)</option>
+                    <option value="2">Medium (2 widths)</option>
+                    <option value="3">Fast (3 widths)</option>
+                </select>
+                <select id="motion-drift-dir" title="Drift direction">
+                    <option value="0" selected>→ East</option>
+                    <option value="1">↗ North-east</option>
+                    <option value="2">↑ North</option>
+                    <option value="3">↖ North-west</option>
+                    <option value="4">← West</option>
+                    <option value="5">↙ South-west</option>
+                    <option value="6">↓ South</option>
+                    <option value="7">↘ South-east</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label for="motion-color" title="The palette rotates through its colors (anchor ramps swing back and forth).">Color cycle:</label>
+                <select id="motion-color">
+                    <option value="0" selected>Off</option>
+                    <option value="1">1 cycle per hold</option>
+                    <option value="2">2 cycles per hold</option>
+                    <option value="3">3 cycles per hold</option>
+                </select>
+            </div>
+        </div>
+        <div class="form-row">
+            <label for="anim-fps" title="Not used for rendering: every frame is identical at any FPS. Only fills in the duration and the FFmpeg command shown after rendering, and the fps in the metadata JSON.">Playback FPS:</label>
+            <input type="number" id="anim-fps" value="24" min="1" max="60" title="Not used for rendering: every frame is identical at any FPS. Only fills in the duration and the FFmpeg command shown after rendering, and the fps in the metadata JSON.">
+            <span class="feature-note">info only: sets the duration &amp; FFmpeg command, not the frames</span>
+        </div>
+        <div class="form-row">
+            <label>Aspect Ratio:</label>
+            <select id="anim-aspect">
+                <option value="4:3">4:3 (classic)</option>
+                <option value="16:9" selected>16:9 (widescreen)</option>
+                <option value="21:9">21:9 (cinematic)</option>
+                <option value="1:1">1:1 (square)</option>
+                <option value="9:16">9:16 (vertical)</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>Quality:</label>
+            <select id="anim-quality">
+                <option value="sd">SD</option>
+                <option value="hd">HD</option>
+                <option value="fullhd" selected>FullHD</option>
+                <option value="4k">4K</option>
+                <option value="8k">8K</option>
+            </select>
+            <span id="anim-size-info">1920x1080</span>
+        </div>
+        <div class="form-row">
+            <label>Morph Mode:</label>
+            <select id="anim-mode">
+                <option value="morph" selected>Shape Morph (shapes flow into each other)</option>
+                <option value="crossfade">Crossfade (smooth image blend)</option>
+                <option value="params">Parameter Morph (subtle texture shift)</option>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>Easing Method:</label>
+            <select id="anim-easing">
+                <optgroup label="Basic">
+                    <option value="linear">Linear (constant speed)</option>
+                    <option value="sine">Sine (smooth in/out)</option>
+                </optgroup>
+                <optgroup label="Quadratic">
+                    <option value="inquad">In Quad (slow start)</option>
+                    <option value="outquad">Out Quad (slow end)</option>
+                    <option value="inoutquad">In-Out Quad</option>
+                </optgroup>
+                <optgroup label="Cubic">
+                    <option value="incubic">In Cubic</option>
+                    <option value="outcubic">Out Cubic</option>
+                    <option value="inoutcubic" selected>In-Out Cubic</option>
+                </optgroup>
+                <optgroup label="Quartic">
+                    <option value="inquart">In Quart</option>
+                    <option value="outquart">Out Quart</option>
+                    <option value="inoutquart">In-Out Quart</option>
+                </optgroup>
+                <optgroup label="Quintic">
+                    <option value="inquint">In Quint</option>
+                    <option value="outquint">Out Quint</option>
+                    <option value="inoutquint">In-Out Quint</option>
+                </optgroup>
+                <optgroup label="Special">
+                    <option value="expo">Expo (extreme)</option>
+                    <option value="circle">Circle (round)</option>
+                    <option value="back">Back (overshoot)</option>
+                    <option value="elastic">Elastic (spring)</option>
+                    <option value="bounce">Bounce (drop)</option>
+                    <option value="gauss">Gauss (bell curve)</option>
+                </optgroup>
+            </select>
+        </div>
+        <div class="form-row">
+            <label>Output Directory:</label>
+            <input type="text" id="anim-dir" value="" placeholder="Current working dir">
+        </div>
+        
+        <button id="render-btn" class="btn-primary btn-large">Render PNG Sequence</button>
+        
+        <div id="render-progress" class="progress-container hidden">
+            <span id="render-status">Starting...</span>
+            <progress id="render-bar" value="0" max="100"></progress>
+            <span id="render-info"></span>
+        </div>
+        
+        <div id="render-result" class="result-message hidden"></div>
+    </div>
+
+    <script src="/static/app.js"></script>
+
+</body>
+</html>
