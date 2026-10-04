@@ -66,6 +66,8 @@ async function fetchGrid() {
 }
 
 function renderGrid(cells) {
+    stopAllPreviews();
+    gridGeneration++;
     gridData = cells;
     const grid = document.getElementById('grid');
     grid.innerHTML = '';
@@ -124,13 +126,91 @@ function renderGrid(cells) {
         btnContainer.appendChild(saveImgBtn);
         btnContainer.appendChild(undoBtn);
 
+        const previewBtn = document.createElement('button');
+        previewBtn.type = 'button';
+        previewBtn.className = 'preview-btn';
+        previewBtn.innerText = '▶';
+        previewBtn.title = 'Preview live motion (Animation Studio settings)';
+        previewBtn.onclick = () => togglePreview(i, img, previewBtn);
+
         cellDiv.appendChild(img);
+        cellDiv.appendChild(previewBtn);
         const badge = strengthBadge(cell.strength);
         if (badge) cellDiv.appendChild(badge);
         cellDiv.appendChild(btnContainer);
 
         grid.appendChild(cellDiv);
     });
+}
+
+// ---- Live motion preview (per cell) ----
+// One loop of the cell's live motion (Animation Studio settings), rendered
+// by the server at grid size and played at a low frame rate.
+
+const PREVIEW_FPS = 8;
+const MAX_PREVIEW_CACHE = 18;
+const previewCache = new Map();   // JSON [genome, motion] -> frame data URLs
+const previewPlayers = new Map(); // cell index -> interval id
+// Bumped on every grid render: a preview that finishes loading after the
+// grid was rebuilt must not play into the replaced elements.
+let gridGeneration = 0;
+
+function stopAllPreviews() {
+    previewPlayers.forEach(id => clearInterval(id));
+    previewPlayers.clear();
+}
+
+function stopPreview(index, img, btn) {
+    clearInterval(previewPlayers.get(index));
+    previewPlayers.delete(index);
+    img.src = gridData[index].image || '';
+    btn.innerText = '▶';
+    btn.classList.remove('playing');
+}
+
+async function togglePreview(index, img, btn) {
+    if (previewPlayers.has(index)) {
+        stopPreview(index, img, btn);
+        return;
+    }
+    const motion = readMotion();
+    if (driftRandom() && motion.drift > 0) motion.drift_dir = randomDriftDirs(1)[0];
+    if (!(motion.flow > 0 || motion.drift > 0 || motion.color > 0 || motion.morph > 0)) {
+        alert('Live motion is set to Still. Pick a motion in the Animation Studio to preview it.');
+        return;
+    }
+    const key = JSON.stringify([gridData[index].genome, motion]);
+    let frames = previewCache.get(key);
+    if (!frames) {
+        const gen = gridGeneration;
+        btn.disabled = true;
+        btn.innerText = '⏳';
+        try {
+            frames = (await postJSON('/api/preview-motion', { index, motion })).frames;
+        } catch (err) {
+            if (gen === gridGeneration) {
+                btn.disabled = false;
+                btn.innerText = '▶';
+            }
+            alert('Preview failed: ' + err.message);
+            return;
+        }
+        previewCache.set(key, frames);
+        if (previewCache.size > MAX_PREVIEW_CACHE) {
+            previewCache.delete(previewCache.keys().next().value); // oldest
+        }
+        if (gen !== gridGeneration) return;
+        btn.disabled = false;
+    }
+
+    let k = 0;
+    img.src = frames[0];
+    btn.innerText = '■';
+    btn.classList.add('playing');
+    previewPlayers.set(index, setInterval(() => {
+        k = (k + 1) % frames.length;
+        img.src = frames[k];
+    }, 1000 / PREVIEW_FPS));
 }
 
 // Mutation strength tiers assigned by the server's slotStrengths
@@ -601,10 +681,10 @@ function updateAnimTotal() {
 }
 
 const MOTION_PRESETS = {
-    still:       { flow: 0,   drift: 0, color: 0 },
-    gentle:      { flow: 0.5, drift: 1, color: 0 },
-    flowing:     { flow: 1.5, drift: 1, color: 1 },
-    psychedelic: { flow: 2.5, drift: 2, color: 3 },
+    still:       { flow: 0,   drift: 0, color: 0, morph: 0 },
+    gentle:      { flow: 0.5, drift: 1, color: 0, morph: 0.5 },
+    flowing:     { flow: 1.5, drift: 1, color: 1, morph: 1 },
+    psychedelic: { flow: 2.5, drift: 2, color: 3, morph: 2 },
 };
 
 function applyMotionPreset(name) {
@@ -613,12 +693,15 @@ function applyMotionPreset(name) {
     document.getElementById('motion-flow').value = p.flow;
     document.getElementById('motion-drift').value = p.drift;
     document.getElementById('motion-color').value = p.color;
+    document.getElementById('motion-morph').value = p.morph;
     updateMotionLabels();
 }
 
 function updateMotionLabels() {
-    document.getElementById('motion-flow-val').innerText =
-        parseFloat(document.getElementById('motion-flow').value).toString();
+    ['flow', 'morph'].forEach(k => {
+        document.getElementById(`motion-${k}-val`).innerText =
+            parseFloat(document.getElementById(`motion-${k}`).value).toString();
+    });
 }
 
 function readMotion() {
@@ -627,7 +710,34 @@ function readMotion() {
         drift: parseInt(document.getElementById('motion-drift').value) || 0,
         drift_dir: parseInt(document.getElementById('motion-drift-dir').value) || 0,
         color: parseInt(document.getElementById('motion-color').value) || 0,
+        morph: parseFloat(document.getElementById('motion-morph').value) || 0,
     };
+}
+
+// ---- Random drift direction per cell ----
+
+function driftRandom() {
+    return document.getElementById('motion-drift-random').checked;
+}
+
+// One random direction (0..7) per queued cell; consecutive cells always
+// differ so every hand-over visibly changes course.
+function randomDriftDirs(n) {
+    const dirs = [];
+    for (let i = 0; i < n; i++) {
+        let d;
+        do { d = Math.floor(Math.random() * 8); } while (i > 0 && d === dirs[i - 1]);
+        dirs.push(d);
+    }
+    return dirs;
+}
+
+function driftDirLabel(d) {
+    return document.querySelector(`#motion-drift-dir option[value="${d}"]`).innerText;
+}
+
+function updateDriftDirState() {
+    document.getElementById('motion-drift-dir').disabled = driftRandom();
 }
 
 function addAnimSource() {
@@ -694,6 +804,9 @@ async function renderAnimation() {
         dir: dir,
         mode: mode
     };
+    if (driftRandom() && payload.motion.drift > 0) {
+        payload.drift_dirs = randomDriftDirs(payload.source_cells.length);
+    }
 
     try {
         showLoading(true);
@@ -714,7 +827,8 @@ async function renderAnimation() {
             resultEl.textContent = `
                 ✅ Animation Rendered Successfully!
                 Sequence: ${payload.source_cells.map(c => 'Cell ' + c).join(' → ')}${payload.source_cells.length === 1 ? ' (seamless loop)' : ''}
-                Timeline: ${hold} frames per cell, ${trans} per transition
+                Timeline: ${hold} frames per cell, ${trans} per transition${payload.drift_dirs ? `
+                Drift: ${payload.source_cells.map((c, i) => `Cell ${c} ${driftDirLabel(payload.drift_dirs[i])}`).join(', ')}` : ''}
                 Output: ${data.output_dir}
                 Total Frames: ${data.total_frames}
                 Duration: ${(data.total_frames/fps).toFixed(1)}s @ ${fps}fps
@@ -742,10 +856,13 @@ document.getElementById('add-source-btn').onclick = addAnimSource;
 ['anim-hold', 'anim-trans', 'anim-fps'].forEach(id => {
     document.getElementById(id).addEventListener('input', updateAnimTotal);
 });
-document.getElementById('motion-flow').addEventListener('input', updateMotionLabels);
+['motion-flow', 'motion-morph'].forEach(id =>
+    document.getElementById(id).addEventListener('input', updateMotionLabels));
 document.querySelectorAll('.motion-presets [data-preset]').forEach(btn => {
     btn.onclick = () => applyMotionPreset(btn.dataset.preset);
 });
+document.getElementById('motion-drift-random').onchange = updateDriftDirState;
+updateDriftDirState();
 updateMotionLabels();
 renderAnimSources();
 document.getElementById('anim-aspect').onchange = updateAnimSizeInfo;
@@ -759,9 +876,9 @@ updateAnimSizeInfo();
 // Animation Studio inputs saved with a session, by element id. Values are
 // stored as the inputs' strings and only applied when still valid, so
 // sessions survive options being added or removed later.
-const ANIM_FIELD_IDS = ['anim-hold', 'anim-trans', 'motion-flow', 'motion-drift',
+const ANIM_FIELD_IDS = ['anim-hold', 'anim-trans', 'motion-flow', 'motion-morph', 'motion-drift',
     'motion-drift-dir', 'motion-color', 'anim-fps', 'anim-aspect', 'anim-quality',
-    'anim-mode', 'anim-easing', 'anim-dir'];
+    'anim-mode', 'anim-easing', 'anim-dir', 'motion-drift-random'];
 
 // Session last saved or restored, highlighted in the list.
 let currentSessionId = null;
@@ -770,7 +887,7 @@ function readAnimSettings() {
     const fields = {};
     ANIM_FIELD_IDS.forEach(id => {
         const el = document.getElementById(id);
-        if (el) fields[id] = el.value;
+        if (el) fields[id] = el.type === 'checkbox' ? (el.checked ? '1' : '0') : el.value;
     });
     return { source_cells: animSources.slice(), fields };
 }
@@ -790,9 +907,14 @@ function applyAnimSettings(a) {
         const el = document.getElementById(id);
         const v = fields[id];
         if (!el || typeof v !== 'string') return;
+        if (el.type === 'checkbox') {
+            el.checked = v === '1';
+            return;
+        }
         if (el.tagName === 'SELECT' && ![...el.options].some(o => o.value === v)) return;
         el.value = v;
     });
+    updateDriftDirState();
     renderAnimSources();
     updateMotionLabels();
     updateAnimSizeInfo();

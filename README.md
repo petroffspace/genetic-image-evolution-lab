@@ -74,7 +74,8 @@ like any other image.
 ### Animation Studio
 
 - **Single-image loops:** an image animates on its own (churning texture,
-  gliding drift, cycling colors), and the clip loops seamlessly.
+  shape-shifting forms, gliding drift, cycling colors), and the clip loops
+  seamlessly.
 - **Sequences** of up to 9 images: each one animates for a while, then morphs
   into the next.
 - **Three transition styles:** *Shape Morph* (shapes flow and reshape into
@@ -133,6 +134,7 @@ Open **http://localhost:8989** in a browser. Stop the server with Ctrl+C.
 | Save this cell's genome (JSON) | 🧬 |
 | Save this image at any size | 🖼️, then enter e.g. `3840x2160` |
 | Undo this cell's last change | ↩️ |
+| Preview this image's live motion (Animation Studio settings) | ▶ / ■ at the image's top right |
 | Replace all unlocked images | **Generate All** |
 
 A typical session: press **Generate All** until something catches your eye,
@@ -159,7 +161,9 @@ genomes you want to keep.
 
    The total length is shown as you type.
 3. **Pick the motion.** Use a preset (*Still*, *Gentle*, *Flowing*,
-   *Psychedelic*), or set **Flow**, **Drift** (speed and direction) and
+   *Psychedelic*), or set **Flow**, **Shape-shift** (forms and textures
+   slowly transform and return), **Drift** (speed and direction; tick
+   **🎲 Random** to give every queued cell its own direction) and
    **Color cycle** yourself.
 4. **Pick the look:** aspect ratio, quality (SD up to 8K), transition style
    and easing.

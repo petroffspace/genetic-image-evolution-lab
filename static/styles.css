@@ -102,6 +102,35 @@ body {
     background: rgba(0, 0, 0, 0.55);
     pointer-events: none;
 }
+/* Live motion preview toggle, top right of each image. */
+.preview-btn {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    width: 26px;
+    height: 26px;
+    border: none;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, 0.55);
+    color: #fff;
+    font-size: 0.7rem;
+    line-height: 26px;
+    text-align: center;
+    cursor: pointer;
+    opacity: 0.75;
+    transition: opacity 0.15s, background 0.15s;
+}
+.preview-btn:hover {
+    opacity: 1;
+    background: rgba(0, 0, 0, 0.75);
+}
+.preview-btn.playing {
+    opacity: 1;
+    background: #8b5cf6;
+}
+.preview-btn:disabled {
+    cursor: wait;
+}
 .strength-gentle { box-shadow: inset 0 0 0 1px #34d399; }
 .strength-normal { box-shadow: inset 0 0 0 1px #8b5cf6; }
 .strength-wild   { box-shadow: inset 0 0 0 1px #f97316; }
@@ -322,6 +351,14 @@ body {
 }
 .motion-panel input[type="range"] {
     flex: 1;
+}
+.form-row label.inline-check {
+    width: auto;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    cursor: pointer;
+    white-space: nowrap;
 }
 .motion-val {
     min-width: 32px;

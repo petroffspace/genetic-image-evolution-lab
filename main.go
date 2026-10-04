@@ -396,10 +396,14 @@ type Genome struct {
 	// Live motion (animation only, never serialized; see animateGenome).
 	// All zero = a still render.
 	motionFlow float64 `json:"-"` // flow strength: spectral phases churn
-	motionTau  float64 `json:"-"` // loop position in [0, 1)
-	driftU     float64 `json:"-"` // texture offset in tile widths
-	driftV     float64 `json:"-"`
-	palShift   float64 `json:"-"` // anchor palette ping-pong shift
+	// motionMorph: shape-shift strength; spectral phases wander along a
+	// closed loop (see morphPhase) and the structure tile is standardized
+	// so the frozen normalization range stays valid as genes oscillate.
+	motionMorph float64 `json:"-"`
+	motionTau   float64 `json:"-"` // loop position in [0, 1)
+	driftU      float64 `json:"-"` // texture offset in tile widths
+	driftV      float64 `json:"-"`
+	palShift    float64 `json:"-"` // anchor palette ping-pong shift
 	// Frozen normalization (animation only): min-max / percentile modes
 	// use [normLo, normHi] instead of the frame's own range, so moving
 	// content does not pump the brightness. normCapture, if set, receives
@@ -965,6 +969,17 @@ func worleyTile(n int, cfg Genome) []float64 {
 			}
 		}
 	}
+	if cfg.motionMorph > 0 {
+		// Shape-shift: points lean partway toward another realization and
+		// back once per loop (staying inside their jitter box, as above).
+		alt := cellPoints(src.offset(2), cells, jitter)
+		w := math.Min(1, 0.2*cfg.motionMorph) * (1 - math.Cos(2*math.Pi*cfg.motionTau)) / 2
+		for i := range pts {
+			for j := range pts[i] {
+				pts[i][j] += (alt[i][j] - pts[i][j]) * w
+			}
+		}
+	}
 	out := make([]float64, n*n)
 	scale := float64(cells) / float64(n) // tile pixels -> cell units
 	parallelRows(n, func(ya, yb int) {
@@ -1285,9 +1300,16 @@ type MotionSpec struct {
 	Drift    int     `json:"drift"`     // tile widths traveled per loop, 0 = off
 	DriftDir int     `json:"drift_dir"` // 0..7: E, NE, N, NW, W, SW, S, SE
 	Color    int     `json:"color"`     // palette cycles per loop, 0 = off
+	Morph    float64 `json:"morph"`     // 0 = off; ~0.5 subtle, 3 wild: forms and textures shape-shift
 }
 
-func (m MotionSpec) active() bool { return m.Flow > 0 || m.Drift > 0 || m.Color > 0 }
+func (m MotionSpec) active() bool { return m.Flow > 0 || m.Drift > 0 || m.Color > 0 || m.Morph > 0 }
+
+// churns reports whether m changes g's tile-space structure from frame to
+// frame (so a per-cell tile cache cannot be shared across frames).
+func (m MotionSpec) churns(g Genome) bool {
+	return g.RD.Mode == 0 && (m.Flow > 0 || (m.Morph > 0 && g.LumaRef == ""))
+}
 
 // driftDirs are whole-tile lattice steps (screen y points down), so a
 // drift of any integer speed returns to the start after one loop.
@@ -1300,10 +1322,15 @@ var driftDirs = [8][2]int{{1, 0}, {1, -1}, {0, -1}, {-1, -1}, {-1, 0}, {-1, 1}, 
 //	       differ, so wrapping would sweep a hard edge through the image).
 //	Drift: the texture slides Drift tiles along a lattice direction.
 //	Flow:  spectral phases (and Worley points) churn; see flowTurns.
+//	Morph: the shape genes (spectral slopes, anisotropy, rotation, band
+//	       limit, warp, layer / cellular / LIC genes) each oscillate on
+//	       their own cycle while the spectral phases wander (morphPhase),
+//	       so forms and textures keep transforming, then return.
 //
-// Reaction-diffusion genomes skip flow (their chaotic growth would turn a
-// churning seed field into flicker), and match-mode genomes skip drift
-// (their luminance comes from a canvas-space reference, not the tile).
+// Reaction-diffusion genomes skip flow and morph (their chaotic growth
+// would turn a changing seed field into flicker), and match-mode genomes
+// skip drift and morph (their luminance comes from a canvas-space
+// reference, not the tile).
 func animateGenome(g Genome, m MotionSpec, tau float64) Genome {
 	if m.Color > 0 {
 		c := float64(m.Color) * tau
@@ -1326,7 +1353,90 @@ func animateGenome(g Genome, m MotionSpec, tau float64) Genome {
 	if m.Flow > 0 && g.RD.Mode == 0 {
 		g.motionFlow, g.motionTau = m.Flow, tau
 	}
+	if m.Morph > 0 && g.RD.Mode == 0 && g.LumaRef == "" {
+		g = morphGenes(g, m.Morph, tau)
+		g.motionMorph, g.motionTau = m.Morph, tau
+	}
 	return g
+}
+
+// morphWave is shape gene k's swing at loop position tau, in [-1, 1]: one
+// whole cycle per loop at a per-genome phase, minus its value at tau = 0,
+// so loops close exactly and a clip starts on the cell itself.
+func morphWave(seed int64, k int, tau float64) float64 {
+	ph := 2 * math.Pi * cellHash(seed, k, 0, 31)
+	return (math.Sin(2*math.Pi*tau+ph) - math.Sin(ph)) / 2
+}
+
+// morphGenes swings g's continuous shape genes around their values by
+// strength s (amplitudes are per unit of s). Genes that are off stay off,
+// and switches that change the render path (cellular-only mix, chroma
+// on/off) are never crossed.
+func morphGenes(g Genome, s, tau float64) Genome {
+	w := func(k int) float64 { return s * morphWave(g.Seed, k, tau) }
+	g.Exponent = clampF(g.Exponent+0.25*w(0), 0.5, 10)
+	if g.BreakFreq > 0.001 {
+		g.ExponentHi = clampF(g.ExponentHi+0.25*w(1), 0.5, 10)
+	}
+	if g.AxisStretch > 0 {
+		g.AxisStretch = clampF(g.AxisStretch*math.Exp(0.15*w(2)), 0.25, 4)
+	}
+	g.SpecRot += 0.2 * w(3)
+	if g.ConeWidth > 0.001 && g.ConeWidth < 0.999 {
+		g.ConeAngle += 0.25 * w(4)
+	}
+	if g.BandLimit > 0 {
+		g.BandLimit = clampF(g.BandLimit*math.Exp(0.15*w(5)), 0.01, 1)
+	}
+	if g.DomainWarp > 0.001 {
+		g.DomainWarp = clampF(g.DomainWarp*(1+0.35*w(6)), 0.001, 0.5)
+	}
+	if g.Gamma > 0 {
+		g.Gamma = clampF(g.Gamma*math.Exp(0.06*w(7)), 0.3, 3)
+	}
+	if g.ReliefStrength > 0 {
+		g.ReliefAngle += 0.3 * w(8)
+	}
+	if g.ChromaStrength > 0.001 {
+		g.ChromaStrength = clampF(g.ChromaStrength*(1+0.25*w(9)), 0.002, 0.8)
+	}
+	if g.Layer.Mode > 0 {
+		g.Layer.Exponent = clampF(g.Layer.Exponent+0.25*w(10), 0.5, 10)
+		g.Layer.Mix = clampF(g.Layer.Mix+0.12*w(11), 0, 1)
+		g.Layer.MaskBias = clampF(g.Layer.MaskBias+0.15*w(12), -1, 1)
+	}
+	if g.Cell.Mode > 0 {
+		g.Cell.Jitter = clampF(g.Cell.Jitter+0.1*w(13), 0, 1)
+		if g.Cell.Mix < 0.999 {
+			g.Cell.Mix = clampF(g.Cell.Mix+0.1*w(14), 0, 0.99)
+		}
+	}
+	if g.Lic.Mode > 0 {
+		g.Lic.Length = clampF(g.Lic.Length*(1+0.2*w(15)), 1, 60)
+	}
+	return g
+}
+
+// morphPhaseAmp is the phase wander (radians per unit strength) a
+// shape-shifting bin reaches at most.
+const morphPhaseAmp = 0.75
+
+// morphTrig precomputes a shape-shift's per-frame terms for morphPhase.
+type morphTrig struct{ c, s float64 }
+
+func newMorphTrig(cfg Genome) morphTrig {
+	th := 2 * math.Pi * cfg.motionTau
+	a := morphPhaseAmp * cfg.motionMorph / 2
+	return morphTrig{a * (math.Cos(th) - 1), a * math.Sin(th)}
+}
+
+// morphPhase is bin (x, y)'s phase offset while shape-shifting: each bin
+// travels its own ellipse through zero (two random weights on cos - 1 and
+// sin), so phases wander without retracing and return after one loop.
+// Low frequencies carry most of the energy, so large forms visibly
+// transform while fine texture shimmers.
+func morphPhase(seed int64, x, y int, t morphTrig) float64 {
+	return (cellHash(seed, x, y, 21)*2-1)*t.c + (cellHash(seed, x, y, 22)*2-1)*t.s
 }
 
 // flowTurns is how many whole turns spectral bin (x, y) at radial
@@ -2167,6 +2277,7 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 		}
 		return p
 	}
+	mt := newMorphTrig(cfg)
 
 	// Spectral spikes: deterministic from Seed. Both the chosen bin and its
 	// Hermitian conjugate are boosted so the real part of the inverse field
@@ -2281,6 +2392,9 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 			if cfg.motionFlow > 0 {
 				phase += flowTurns(x, y, f, cfg.motionFlow) * 2 * math.Pi * cfg.motionTau
 			}
+			if cfg.motionMorph > 0 {
+				phase += morphPhase(cfg.Seed, x, y, mt)
+			}
 			v := complex(amp*math.Cos(phase), amp*math.Sin(phase))
 			data[y][x] = v
 			data[ym][xm] = complex(real(v), -imag(v))
@@ -2326,10 +2440,11 @@ func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cf
 		cfg                          Genome
 		rng, selfB, to, toB          *rand.Rand
 		selfBlend, phaseBlend, toBld float64
+		mt                           morphTrig
 	}
 	mk := func(rng *rand.Rand, c Genome) *channel {
 		ch := &channel{cfg: c, rng: rng, selfBlend: clampF(c.SeedBlend, 0, 1),
-			phaseBlend: clampF(c.phaseBlend, 0, 1), toBld: clampF(c.phaseTo.blend, 0, 1)}
+			phaseBlend: clampF(c.phaseBlend, 0, 1), toBld: clampF(c.phaseTo.blend, 0, 1), mt: newMorphTrig(c)}
 		if c.phases().blended() {
 			ch.selfB = rand.New(rand.NewSource(c.SeedB))
 		}
@@ -2356,6 +2471,9 @@ func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cf
 		}
 		if ch.cfg.motionFlow > 0 {
 			phase += flowTurns(x, y, f, ch.cfg.motionFlow) * 2 * math.Pi * ch.cfg.motionTau
+		}
+		if ch.cfg.motionMorph > 0 {
+			phase += morphPhase(ch.cfg.Seed, x, y, ch.mt)
 		}
 		return phase
 	}
@@ -2676,6 +2794,13 @@ func spectralField(width, height int, rng *rand.Rand, cfg Genome) specField {
 		}
 		if cfg.Lic.Mode > 0 {
 			stage("lic", func() { applyLic(canonical, padT, cfg) })
+		}
+		if cfg.motionMorph > 0 {
+			// Shape-shifting genes change the field's overall amplitude (a
+			// steeper slope is a louder field); normalization is affine-
+			// invariant, so standardizing changes nothing but keeps every
+			// frame on the range frozen at the cell's first frame.
+			standardize(canonical)
 		}
 		return canonical
 	}
@@ -6083,6 +6208,9 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 		HoldFrames       int        `json:"hold_frames"`
 		TransitionFrames int        `json:"transition_frames"`
 		Motion           MotionSpec `json:"motion"`
+		// DriftDirs (optional, one per source cell) overrides
+		// Motion.DriftDir per cell, e.g. a random direction for each.
+		DriftDirs []int `json:"drift_dirs"`
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -6117,9 +6245,21 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m := req.Motion
-		if m.Flow < 0 || m.Flow > 5 || m.Drift < 0 || m.Drift > 8 || m.Color < 0 || m.Color > 8 {
-			jsonError(w, "Motion out of range (flow 0-5, drift 0-8, color 0-8)", http.StatusBadRequest)
+		if !m.valid() {
+			jsonError(w, motionRangeMsg, http.StatusBadRequest)
 			return
+		}
+		if req.DriftDirs != nil {
+			if len(req.DriftDirs) != len(sources) {
+				jsonError(w, "drift_dirs needs one direction per source cell", http.StatusBadRequest)
+				return
+			}
+			for _, d := range req.DriftDirs {
+				if d < 0 || d > 7 {
+					jsonError(w, "Drift directions must be 0-7", http.StatusBadRequest)
+					return
+				}
+			}
 		}
 		n := len(sources)
 		req.Frames = n*req.HoldFrames + (n-1)*req.TransitionFrames
@@ -6306,13 +6446,25 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 			g.MutationRate, g.MutationPower = 0, 0
 			return g
 		}
+		// motionOf is cell i's live motion: its own drift direction when
+		// per-cell directions were given. A cell keeps its direction for
+		// all its frames (holds and both transitions it takes part in), so
+		// its drift stays continuous.
+		motionOf := func(i int) MotionSpec {
+			m := req.Motion
+			if req.DriftDirs != nil {
+				m.DriftDir = req.DriftDirs[i]
+			}
+			return m
+		}
 		workers := animWorkers(genomes, req.Width, req.Height)
 
-		// Per-cell tile cache: without live flow (or for RD cells, which
-		// skip flow) a cell's tile-space work is identical on every frame.
+		// Per-cell tile cache: without live flow or shape-shift (or for
+		// cells that skip them) a cell's tile-space work is identical on
+		// every frame.
 		caches := make([]*tileCacheEntry, n)
 		for i := range genomes {
-			if !animSerialForTest && (req.Motion.Flow == 0 || genomes[i].RD.Mode > 0) {
+			if !animSerialForTest && !req.Motion.churns(genomes[i]) {
 				caches[i] = &tileCacheEntry{}
 			}
 		}
@@ -6325,12 +6477,12 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 		quants := make([][]float64, n)
 		first := make([]*image.RGBA, n)
 		parallelLimit(n, workers, func(i int) {
-			g := animateGenome(clean(genomes[i]), req.Motion, tau(startOf(i)))
+			g := animateGenome(clean(genomes[i]), motionOf(i), tau(startOf(i)))
 			g.normCapture, g.normCaptureQuant, g.tileCache = &ranges[i], &quants[i], caches[i]
 			first[i] = renderEndpoint(g)
 		})
 		live := func(i, f int) Genome {
-			g := animateGenome(clean(genomes[i]), req.Motion, tau(f))
+			g := animateGenome(clean(genomes[i]), motionOf(i), tau(f))
 			g.normFix, g.normLo, g.normHi, g.normQuant = true, ranges[i][0], ranges[i][1], quants[i]
 			g.tileCache = caches[i]
 			return g
@@ -6669,6 +6821,9 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 		animJSON["hold_frames"] = req.HoldFrames
 		animJSON["transition_frames"] = req.TransitionFrames
 		animJSON["motion"] = req.Motion
+		if req.DriftDirs != nil {
+			animJSON["drift_dirs"] = req.DriftDirs
+		}
 		if len(sources) == 1 {
 			animJSON["seamless_loop"] = true
 		}
@@ -7871,6 +8026,7 @@ func main() {
 	http.HandleFunc("/api/undo", handleUndo)
 	http.HandleFunc("/api/get-genome", handleGetGenome)
 	http.HandleFunc("/api/features", handleFeatures)
+	http.HandleFunc("/api/preview-motion", handlePreviewMotion)
 	registerSessionRoutes()
 
 	fmt.Printf("Genetic Image Evolution Lab\n")

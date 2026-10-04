@@ -1687,7 +1687,7 @@ func TestTimelineAnimation(t *testing.T) {
 		g.RD.Mode = 0
 		state.cells[i].Genome = g
 	}
-	motion := map[string]interface{}{"flow": 1.0, "drift": 1, "drift_dir": 1, "color": 1}
+	motion := map[string]interface{}{"flow": 1.0, "drift": 1, "drift_dir": 1, "color": 1, "morph": 1.0}
 	base := func(cells []int, hold, trans int, mode string) map[string]interface{} {
 		return map[string]interface{}{"source_cells": cells, "hold_frames": hold, "transition_frames": trans,
 			"fps": 24, "width": 160, "height": 90, "easing": "inoutcubic", "mode": mode, "motion": motion}
@@ -1745,7 +1745,7 @@ func TestMotionLoopsExactly(t *testing.T) {
 		if i == 3 {
 			g.SymmetryFold, g.PaletteMode, g.AnchorCount = 5, 1, 3
 		}
-		m := MotionSpec{Flow: 1.5, Drift: 2, DriftDir: i * 3, Color: 1}
+		m := MotionSpec{Flow: 1.5, Drift: 2, DriftDir: i * 3, Color: 1, Morph: 1.5}
 		a := renderExactFramed(animateGenome(g, m, 0), 160, 90)
 		b := renderExactFramed(animateGenome(g, m, 1), 160, 90)
 		if d := meanAbsDiff(a, b); d > 0.01 {
@@ -1753,6 +1753,29 @@ func TestMotionLoopsExactly(t *testing.T) {
 		}
 		if d := meanAbsDiff(renderExactFramed(animateGenome(g, MotionSpec{}, 0.37), 160, 90), renderExactFramed(g, 160, 90)); d != 0 {
 			t.Errorf("genome %d: no motion is not the still render (%.3f)", i, d)
+		}
+	}
+}
+
+// Shape-shift starts on the cell itself (tau = 0 is the still render up
+// to rounding), then visibly transforms it mid-loop without replacing it:
+// the halfway frame differs clearly from the start, yet far less than an
+// unrelated genome does.
+func TestMorphTransformsGently(t *testing.T) {
+	r := rand.New(rand.NewSource(21))
+	m := MotionSpec{Morph: 1}
+	for i := 0; i < 6; i++ {
+		g := randomGenome(r)
+		g.RD.Mode = 0
+		other := randomGenome(r)
+		still := renderExactFramed(g, 160, 90)
+		if d := meanAbsDiff(renderExactFramed(animateGenome(g, m, 0), 160, 90), still); d > 0.5 {
+			t.Errorf("genome %d: shape-shift at tau 0 differs from the cell by %.3f", i, d)
+		}
+		mid := meanAbsDiff(renderExactFramed(animateGenome(g, m, 0.5), 160, 90), still)
+		far := meanAbsDiff(renderExactFramed(other, 160, 90), still)
+		if mid < 1 || mid > 0.6*far {
+			t.Errorf("genome %d: halfway shape-shift moved %.2f (unrelated genome: %.2f)", i, mid, far)
 		}
 	}
 }
@@ -1800,6 +1823,7 @@ func TestParallelAnimationByteIdentical(t *testing.T) {
 		{[]int{0, 2, 3}, "crossfade", map[string]interface{}{"flow": 1.0, "drift": 1}},         // flow: RD cell cached only
 		{[]int{1, 2, 4}, "morph", map[string]interface{}{"flow": 0.5, "drift": 2, "color": 2}}, // morph keys shared
 		{[]int{5}, "params", map[string]interface{}{"drift": 1, "drift_dir": 3}},               // single-cell loop
+		{[]int{6, 7}, "crossfade", map[string]interface{}{"morph": 1.0, "color": 1}},           // shape-shift: uncached
 	}
 	for _, c := range cases {
 		body := func() map[string]interface{} {
@@ -1849,6 +1873,7 @@ func TestSynthPairMatchesSeparateChannels(t *testing.T) {
 		"seed blend": func(g *Genome) { g.SeedB, g.SeedBlend = 123, 0.4 },
 		"partner":    func(g *Genome) { g.phaseTo, g.phaseBlend = phaseSource{seed: 999, seedB: 5, blend: 0.3}, 0.6 },
 		"flow":       func(g *Genome) { g.motionFlow, g.motionTau = 1.5, 0.37 },
+		"morph":      func(g *Genome) { g.motionMorph, g.motionTau = 1.2, 0.61 },
 		"scout":      func(g *Genome) { g.scoutTile = 256 },
 	}
 	for name, mod := range variants {
@@ -1906,6 +1931,50 @@ func TestVersion6VisuallyIdentical(t *testing.T) {
 		}
 		if worst > 1 {
 			t.Errorf("genome %d: v6 differs from v5 by up to %d levels", i, worst)
+		}
+	}
+}
+
+// Per-cell drift directions: each cell's hold frames are exactly what a
+// clip with that direction for every cell renders, and malformed
+// direction lists are rejected.
+func TestPerCellDriftDirections(t *testing.T) {
+	state = NewAppState(t.TempDir())
+	r := rand.New(rand.NewSource(17))
+	for i := range state.cells {
+		g := randomGenome(r)
+		g.RD.Mode = 0
+		state.cells[i].Genome = g
+	}
+	const hold, trans = 4, 3
+	body := func(dir int, dirs []int) map[string]interface{} {
+		b := map[string]interface{}{"source_cells": []int{0, 1}, "hold_frames": hold, "transition_frames": trans,
+			"fps": 24, "width": 96, "height": 54, "mode": "crossfade",
+			"motion": map[string]interface{}{"drift": 2, "drift_dir": dir}}
+		if dirs != nil {
+			b["drift_dirs"] = dirs
+		}
+		return b
+	}
+	mixed := animationFiles(t, body(0, []int{2, 5}))
+	north := animationFiles(t, body(2, nil))
+	southWest := animationFiles(t, body(5, nil))
+	for k := 0; k < hold; k++ {
+		if !bytes.Equal(mixed[k], north[k]) {
+			t.Errorf("cell 0 hold frame %d does not drift north", k)
+		}
+		if f := hold + trans + k; !bytes.Equal(mixed[f], southWest[f]) {
+			t.Errorf("cell 1 hold frame %d does not drift south-west", k)
+		}
+	}
+	if bytes.Equal(mixed[hold+trans+1], north[hold+trans+1]) {
+		t.Error("cell 1 ignored its own direction")
+	}
+
+	for _, dirs := range [][]int{{1}, {1, 8}, {-1, 0}} {
+		code, _, _ := runAnimation(t, body(0, dirs))
+		if code != 400 {
+			t.Errorf("drift_dirs %v: code %d, want 400", dirs, code)
 		}
 	}
 }

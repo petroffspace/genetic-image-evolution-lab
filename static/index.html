@@ -24,7 +24,7 @@
         <button id="generate-btn" class="btn-primary">Generate All</button>
     </div>
     <div class="footer-info">
-        Click image: evolve (children run gentle → wild, top to bottom) · 🔒/🔓: Lock · 📤: Upload & reverse engineer · 📂: Load params · 🧬: Save params · 🖼️: Save image · ↩️: Undo
+        Click image: evolve (children run gentle → wild, top to bottom) · 🔒/🔓: Lock · 📤: Upload & reverse engineer · 📂: Load params · 🧬: Save params · 🖼️: Save image · ↩️: Undo · ▶: Preview live motion
     </div>
         <div class="feature-panel">
             <strong>Renderer features</strong> <span class="feature-note">(apply to newly generated images only)</span>
@@ -82,6 +82,11 @@
                 <span id="motion-flow-val" class="motion-val">0.5</span>
             </div>
             <div class="form-row">
+                <label for="motion-morph" title="Forms and textures slowly transform and return: the shape genes (spectral slopes, stretch, rotation, warp...) breathe on their own cycles while the shapes wander. Reaction-diffusion and photo-matched cells skip it.">Shape-shift:</label>
+                <input type="range" id="motion-morph" min="0" max="3" step="0.25" value="0.5">
+                <span id="motion-morph-val" class="motion-val">0.5</span>
+            </div>
+            <div class="form-row">
                 <label for="motion-drift" title="The image glides through its endlessly repeating texture (symmetric images become a moving kaleidoscope). Speed = texture widths traveled per hold.">Drift:</label>
                 <select id="motion-drift">
                     <option value="0">Off</option>
@@ -99,6 +104,9 @@
                     <option value="6">↓ South</option>
                     <option value="7">↘ South-east</option>
                 </select>
+                <label class="inline-check" title="Every cell in the animation queue drifts in its own random direction (consecutive cells always differ). Picked anew for each render and each preview.">
+                    <input type="checkbox" id="motion-drift-random"> 🎲 Random
+                </label>
             </div>
             <div class="form-row">
                 <label for="motion-color" title="The palette rotates through its colors (anchor ramps swing back and forth).">Color cycle:</label>
