@@ -145,72 +145,129 @@ function renderGrid(cells) {
 
 // ---- Live motion preview (per cell) ----
 // One loop of the cell's live motion (Animation Studio settings), rendered
-// by the server at grid size and played at a low frame rate.
+// by the server at grid size and played at a low frame rate. Playing
+// previews re-render when the motion settings change.
 
 const PREVIEW_FPS = 8;
 const MAX_PREVIEW_CACHE = 18;
+const PREVIEW_REFRESH_DELAY = 350; // ms of quiet before re-rendering
 const previewCache = new Map();   // JSON [genome, motion] -> frame data URLs
-const previewPlayers = new Map(); // cell index -> interval id
+// cell index -> {img, btn, timer, frames, k, dir}; dir is the cell's
+// random drift direction, kept while other settings change.
+const previewPlayers = new Map();
 // Bumped on every grid render: a preview that finishes loading after the
 // grid was rebuilt must not play into the replaced elements.
 let gridGeneration = 0;
+// Bumped on every settings refresh, so only the latest one is applied.
+let previewRefreshToken = 0;
+let previewRefreshTimer = null;
 
-function stopAllPreviews() {
-    previewPlayers.forEach(id => clearInterval(id));
-    previewPlayers.clear();
+function motionIsStill(m) {
+    return !(m.flow > 0 || m.drift > 0 || m.color > 0 || m.morph > 0);
 }
 
-function stopPreview(index, img, btn) {
-    clearInterval(previewPlayers.get(index));
-    previewPlayers.delete(index);
-    img.src = gridData[index].image || '';
-    btn.innerText = '▶';
-    btn.classList.remove('playing');
+// The motion a cell previews with: the current settings, with the cell's
+// own direction when drift directions are random.
+function previewMotionFor(dir) {
+    const m = readMotion();
+    if (driftRandom() && m.drift > 0) m.drift_dir = dir;
+    return m;
 }
 
-async function togglePreview(index, img, btn) {
-    if (previewPlayers.has(index)) {
-        stopPreview(index, img, btn);
-        return;
-    }
-    const motion = readMotion();
-    if (driftRandom() && motion.drift > 0) motion.drift_dir = randomDriftDirs(1)[0];
-    if (!(motion.flow > 0 || motion.drift > 0 || motion.color > 0 || motion.morph > 0)) {
-        alert('Live motion is set to Still. Pick a motion in the Animation Studio to preview it.');
-        return;
-    }
+async function fetchPreviewFrames(index, motion) {
     const key = JSON.stringify([gridData[index].genome, motion]);
     let frames = previewCache.get(key);
     if (!frames) {
-        const gen = gridGeneration;
-        btn.disabled = true;
-        btn.innerText = '⏳';
-        try {
-            frames = (await postJSON('/api/preview-motion', { index, motion })).frames;
-        } catch (err) {
-            if (gen === gridGeneration) {
-                btn.disabled = false;
-                btn.innerText = '▶';
-            }
-            alert('Preview failed: ' + err.message);
-            return;
-        }
+        frames = (await postJSON('/api/preview-motion', { index, motion })).frames;
         previewCache.set(key, frames);
         if (previewCache.size > MAX_PREVIEW_CACHE) {
             previewCache.delete(previewCache.keys().next().value); // oldest
         }
-        if (gen !== gridGeneration) return;
-        btn.disabled = false;
     }
+    return frames;
+}
 
-    let k = 0;
+function stopAllPreviews() {
+    previewPlayers.forEach(p => clearInterval(p.timer));
+    previewPlayers.clear();
+}
+
+function stopPreview(index) {
+    const p = previewPlayers.get(index);
+    if (!p) return;
+    clearInterval(p.timer);
+    previewPlayers.delete(index);
+    p.img.src = gridData[index].image || '';
+    p.btn.innerText = '▶';
+    p.btn.classList.remove('playing', 'updating');
+}
+
+async function togglePreview(index, img, btn) {
+    if (previewPlayers.has(index)) {
+        stopPreview(index);
+        return;
+    }
+    const dir = randomDriftDirs(1)[0];
+    const motion = previewMotionFor(dir);
+    if (motionIsStill(motion)) {
+        alert('Live motion is set to Still. Pick a motion in the Animation Studio to preview it.');
+        return;
+    }
+    const gen = gridGeneration;
+    btn.disabled = true;
+    btn.innerText = '⏳';
+    let frames;
+    try {
+        frames = await fetchPreviewFrames(index, motion);
+    } catch (err) {
+        if (gen === gridGeneration) {
+            btn.disabled = false;
+            btn.innerText = '▶';
+        }
+        alert('Preview failed: ' + err.message);
+        return;
+    }
+    if (gen !== gridGeneration) return;
+    btn.disabled = false;
+
+    const p = { img, btn, frames, k: 0, dir };
     img.src = frames[0];
     btn.innerText = '■';
     btn.classList.add('playing');
-    previewPlayers.set(index, setInterval(() => {
-        k = (k + 1) % frames.length;
-        img.src = frames[k];
-    }, 1000 / PREVIEW_FPS));
+    p.timer = setInterval(() => {
+        p.k = (p.k + 1) % p.frames.length;
+        p.img.src = p.frames[p.k];
+    }, 1000 / PREVIEW_FPS);
+    previewPlayers.set(index, p);
+}
+
+function schedulePreviewRefresh() {
+    if (!previewPlayers.size) return;
+    clearTimeout(previewRefreshTimer);
+    previewRefreshTimer = setTimeout(refreshPreviews, PREVIEW_REFRESH_DELAY);
+}
+
+// Re-renders every playing preview with the current motion settings. The
+// old loop keeps playing (button pulsing) until the new one arrives.
+function refreshPreviews() {
+    if (motionIsStill(readMotion())) {
+        [...previewPlayers.keys()].forEach(stopPreview);
+        return;
+    }
+    const token = ++previewRefreshToken;
+    const gen = gridGeneration;
+    previewPlayers.forEach(async (p, index) => {
+        p.btn.classList.add('updating');
+        try {
+            const frames = await fetchPreviewFrames(index, previewMotionFor(p.dir));
+            if (token !== previewRefreshToken || gen !== gridGeneration || previewPlayers.get(index) !== p) return;
+            p.frames = frames;
+            p.k %= frames.length;
+        } catch (err) {
+            console.error('Preview refresh failed:', err);
+        }
+        if (token === previewRefreshToken) p.btn.classList.remove('updating');
+    });
 }
 
 // Mutation strength tiers assigned by the server's slotStrengths
@@ -695,6 +752,7 @@ function applyMotionPreset(name) {
     document.getElementById('motion-color').value = p.color;
     document.getElementById('motion-morph').value = p.morph;
     updateMotionLabels();
+    schedulePreviewRefresh();
 }
 
 function updateMotionLabels() {
@@ -862,6 +920,11 @@ document.querySelectorAll('.motion-presets [data-preset]').forEach(btn => {
     btn.onclick = () => applyMotionPreset(btn.dataset.preset);
 });
 document.getElementById('motion-drift-random').onchange = updateDriftDirState;
+// Playing previews follow the motion settings.
+['motion-flow', 'motion-morph'].forEach(id =>
+    document.getElementById(id).addEventListener('input', schedulePreviewRefresh));
+['motion-drift', 'motion-drift-dir', 'motion-color', 'motion-drift-random'].forEach(id =>
+    document.getElementById(id).addEventListener('change', schedulePreviewRefresh));
 updateDriftDirState();
 updateMotionLabels();
 renderAnimSources();

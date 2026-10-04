@@ -128,6 +128,14 @@ body {
     opacity: 1;
     background: #8b5cf6;
 }
+/* Re-rendering for new motion settings; the old loop keeps playing. */
+.preview-btn.updating {
+    animation: preview-pulse 0.7s ease-in-out infinite alternate;
+}
+@keyframes preview-pulse {
+    from { opacity: 1; }
+    to { opacity: 0.35; }
+}
 .preview-btn:disabled {
     cursor: wait;
 }
