@@ -6195,13 +6195,15 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 	// interleave-writes into the same folder, and MkdirAll errors are
 	// caught immediately instead of surfacing as a cryptic os.Create
 	// failure halfway through the render.
+	// The sequence is tagged compactly (cells 3, 1, 0 -> "c3-1-0") so a
+	// full 9-cell chain stays short; the metadata JSON has the details.
 	timestamp := time.Now().Format("20060102_150405")
 	cellTags := make([]string, len(sources))
 	for i, c := range sources {
-		cellTags[i] = fmt.Sprintf("%04d", c)
+		cellTags[i] = strconv.Itoa(c)
 	}
 	outputDir := filepath.Join(saveDir,
-		fmt.Sprintf("anim_%s_%s_%d", strings.Join(cellTags, "_to_"),
+		fmt.Sprintf("anim_c%s_%s_%06d", strings.Join(cellTags, "-"),
 			timestamp, time.Now().UnixNano()%1000000))
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		jsonError(w, "Cannot create output directory: "+err.Error(), http.StatusInternalServerError)
