@@ -91,6 +91,12 @@ like any other image.
 - **Genomes**: save as JSON and load back later or on another machine. A
   loaded genome always reproduces exactly the same image, even after the app
   itself is updated.
+- **Sessions**: the 🗂️ Sessions sidebar saves the whole workspace in one
+  click: every cell's genome, lock and preview, the renderer feature toggles
+  and all Animation Studio settings. Sessions are named with the current date
+  by default and can be renamed, restored or deleted. They are stored under
+  `sessions/` in the working directory. Restoring puts each cell's previous
+  genome on its undo stack, so ↩️ still works afterwards.
 
 ## Installation
 

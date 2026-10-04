@@ -7,6 +7,18 @@
     <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
+    <aside id="sessions-sidebar" class="sessions-sidebar" aria-label="Saved sessions">
+        <div class="sessions-head">
+            <h2>🗂️ Sessions</h2>
+            <button id="sessions-close" type="button" class="sessions-close" title="Close sidebar">✕</button>
+        </div>
+        <button id="session-save-btn" type="button" class="btn-primary session-save-btn"
+                title="Save the grid genomes, renderer features and Animation Studio settings (named with the current date)">💾 Save current session</button>
+        <div id="sessions-list" class="sessions-list"></div>
+    </aside>
+
+    <button id="sessions-toggle" type="button" class="sessions-toggle" title="Show / hide saved sessions">🗂️ Sessions</button>
+
     <div class="header">
         <h1>Genetic Image Evolution Lab</h1>
         <button id="generate-btn" class="btn-primary">Generate All</button>

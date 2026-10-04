@@ -445,14 +445,17 @@ const FEATURE_IDS = ['transform', 'relief', 'spikes', 'chroma', 'cone',
 async function loadFeatures() {
     try {
         const res = await fetch('/api/features');
-        const f = await res.json();
-        FEATURE_IDS.forEach(id => {
-            const cb = document.getElementById('feat-' + id);
-            if (cb && typeof f[id] === 'boolean') cb.checked = f[id];
-        });
+        applyFeatureCheckboxes(await res.json());
     } catch (err) {
         console.error('Failed to load feature settings:', err);
     }
+}
+
+function applyFeatureCheckboxes(f) {
+    FEATURE_IDS.forEach(id => {
+        const cb = document.getElementById('feat-' + id);
+        if (cb && typeof f[id] === 'boolean') cb.checked = f[id];
+    });
 }
 
 function setupFeatures() {
@@ -748,3 +751,225 @@ renderAnimSources();
 document.getElementById('anim-aspect').onchange = updateAnimSizeInfo;
 document.getElementById('anim-quality').onchange = updateAnimSizeInfo;
 updateAnimSizeInfo();
+
+// ============================================================================
+// SESSIONS
+// ============================================================================
+
+// Animation Studio inputs saved with a session, by element id. Values are
+// stored as the inputs' strings and only applied when still valid, so
+// sessions survive options being added or removed later.
+const ANIM_FIELD_IDS = ['anim-hold', 'anim-trans', 'motion-flow', 'motion-drift',
+    'motion-drift-dir', 'motion-color', 'anim-fps', 'anim-aspect', 'anim-quality',
+    'anim-mode', 'anim-easing', 'anim-dir'];
+
+// Session last saved or restored, highlighted in the list.
+let currentSessionId = null;
+
+function readAnimSettings() {
+    const fields = {};
+    ANIM_FIELD_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        if (el) fields[id] = el.value;
+    });
+    return { source_cells: animSources.slice(), fields };
+}
+
+function applyAnimSettings(a) {
+    if (!a || typeof a !== 'object') return;
+    if (Array.isArray(a.source_cells)) {
+        const cells = [];
+        a.source_cells.forEach(c => {
+            c = parseInt(c);
+            if (c >= 0 && c < TOTAL_CELLS && !cells.includes(c)) cells.push(c);
+        });
+        if (cells.length) animSources = cells.slice(0, MAX_ANIM_SOURCES);
+    }
+    const fields = a.fields || {};
+    ANIM_FIELD_IDS.forEach(id => {
+        const el = document.getElementById(id);
+        const v = fields[id];
+        if (!el || typeof v !== 'string') return;
+        if (el.tagName === 'SELECT' && ![...el.options].some(o => o.value === v)) return;
+        el.value = v;
+    });
+    renderAnimSources();
+    updateMotionLabels();
+    updateAnimSizeInfo();
+}
+
+function setSessionsOpen(open) {
+    document.body.classList.toggle('sessions-open', open);
+    try { localStorage.setItem('sessionsOpen', open ? '1' : '0'); } catch (e) {}
+    if (open) loadSessions();
+}
+
+async function loadSessions() {
+    const list = document.getElementById('sessions-list');
+    try {
+        const res = await fetch('/api/sessions');
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+        renderSessions(data.sessions);
+    } catch (err) {
+        list.innerHTML = '';
+        const msg = document.createElement('div');
+        msg.className = 'sessions-empty';
+        msg.textContent = 'Failed to load sessions: ' + err.message;
+        list.appendChild(msg);
+    }
+}
+
+function renderSessions(sessions) {
+    const list = document.getElementById('sessions-list');
+    list.innerHTML = '';
+    if (!sessions.length) {
+        const msg = document.createElement('div');
+        msg.className = 'sessions-empty';
+        msg.textContent = 'No saved sessions yet. Click “Save current session” to keep this grid.';
+        list.appendChild(msg);
+        return;
+    }
+    sessions.forEach(s => list.appendChild(sessionItem(s)));
+}
+
+function sessionItem(s) {
+    const item = document.createElement('div');
+    item.className = 'session-item' + (s.id === currentSessionId ? ' current' : '');
+
+    const thumb = document.createElement('img');
+    thumb.className = 'session-thumb';
+    thumb.src = s.thumb;
+    thumb.alt = s.name;
+    thumb.loading = 'lazy';
+    thumb.title = 'Restore this session';
+    thumb.onclick = () => restoreSession(s);
+
+    const nameRow = document.createElement('div');
+    nameRow.className = 'session-name-row';
+    const name = document.createElement('span');
+    name.className = 'session-name';
+    name.textContent = s.name;
+    name.title = s.name;
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.className = 'btn btn-icon';
+    editBtn.innerText = '✏️';
+    editBtn.title = 'Rename';
+    editBtn.onclick = () => startRename(s, nameRow);
+    nameRow.appendChild(name);
+    nameRow.appendChild(editBtn);
+
+    const meta = document.createElement('div');
+    meta.className = 'session-meta';
+    const created = new Date(s.created);
+    meta.textContent = (isNaN(created) ? s.created : created.toLocaleString()) +
+        (s.locked ? ` · ${s.locked} locked` : '');
+
+    const actions = document.createElement('div');
+    actions.className = 'session-actions';
+    const restoreBtn = document.createElement('button');
+    restoreBtn.type = 'button';
+    restoreBtn.className = 'btn btn-restore';
+    restoreBtn.innerText = '↺ Restore';
+    restoreBtn.title = 'Restore grid, renderer features and Animation Studio settings';
+    restoreBtn.onclick = () => restoreSession(s);
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'btn btn-delete';
+    deleteBtn.innerText = '🗑️';
+    deleteBtn.title = 'Delete session';
+    deleteBtn.onclick = () => deleteSession(s);
+    actions.appendChild(restoreBtn);
+    actions.appendChild(deleteBtn);
+
+    item.appendChild(thumb);
+    item.appendChild(nameRow);
+    item.appendChild(meta);
+    item.appendChild(actions);
+    return item;
+}
+
+// Swaps the name for an input: Enter or blur saves, Escape cancels.
+function startRename(s, nameRow) {
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'session-name-input';
+    input.value = s.name;
+    input.maxLength = 120;
+    nameRow.replaceChildren(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = async (save) => {
+        if (done) return;
+        done = true;
+        const name = input.value.trim();
+        if (save && name && name !== s.name) {
+            try {
+                await postJSON('/api/sessions/rename', { id: s.id, name });
+            } catch (err) {
+                alert('Rename failed: ' + err.message);
+            }
+        }
+        loadSessions();
+    };
+    input.onkeydown = e => {
+        if (e.key === 'Enter') finish(true);
+        else if (e.key === 'Escape') finish(false);
+    };
+    input.onblur = () => finish(true);
+}
+
+async function saveSession() {
+    const btn = document.getElementById('session-save-btn');
+    btn.disabled = true;
+    try {
+        const data = await postJSON('/api/sessions/save', { animation: readAnimSettings() });
+        currentSessionId = data.id;
+        if (!document.body.classList.contains('sessions-open')) setSessionsOpen(true);
+        else await loadSessions();
+    } catch (err) {
+        alert('Save session failed: ' + err.message);
+    } finally {
+        btn.disabled = false;
+    }
+}
+
+async function restoreSession(s) {
+    showLoading(true);
+    document.getElementById('loading-text').innerText = `Restoring “${s.name}”...`;
+    try {
+        const data = await postJSON('/api/sessions/restore', { id: s.id });
+        applyFeatureCheckboxes(data.features || {});
+        applyAnimSettings(data.animation);
+        currentSessionId = s.id;
+        await fetchGrid();
+        loadSessions();
+    } catch (err) {
+        showLoading(false);
+        alert('Restore failed: ' + err.message);
+    }
+}
+
+async function deleteSession(s) {
+    if (!confirm(`Delete session “${s.name}”? This cannot be undone.`)) return;
+    try {
+        await postJSON('/api/sessions/delete', { id: s.id });
+        if (currentSessionId === s.id) currentSessionId = null;
+    } catch (err) {
+        alert('Delete failed: ' + err.message);
+    }
+    loadSessions();
+}
+
+document.getElementById('session-save-btn').onclick = saveSession;
+document.getElementById('sessions-toggle').onclick = () =>
+    setSessionsOpen(!document.body.classList.contains('sessions-open'));
+document.getElementById('sessions-close').onclick = () => setSessionsOpen(false);
+(() => {
+    let open = false;
+    try { open = localStorage.getItem('sessionsOpen') === '1'; } catch (e) {}
+    if (open) setSessionsOpen(true);
+})();

@@ -328,3 +328,181 @@ body {
     color: #8b5cf6;
     font-weight: bold;
 }
+
+/* Sessions sidebar (left drawer). */
+/* Vertical tab on the left edge, centered; rides the sidebar's edge when open. */
+.sessions-toggle {
+    position: fixed;
+    top: 50%;
+    left: 0;
+    transform: translateY(-50%);
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    padding: 14px 7px;
+    border: 1px solid #2a3b66;
+    border-left: none;
+    border-radius: 0 8px 8px 0;
+    background: #2a3b66;
+    color: #eee;
+    font-size: 0.9rem;
+    cursor: pointer;
+    box-shadow: 2px 0 8px rgba(0,0,0,0.4);
+    transition: left 0.2s ease, background 0.2s;
+    z-index: 51;
+}
+.sessions-toggle:hover {
+    background: #3a4b76;
+}
+body.sessions-open .sessions-toggle {
+    left: min(300px, 85vw);
+    background: #4c3a8a;
+}
+
+body {
+    transition: padding-left 0.2s ease;
+}
+.sessions-sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 300px;
+    max-width: 85vw;
+    background: #12182f;
+    border-right: 1px solid #2a3b66;
+    box-shadow: 4px 0 12px rgba(0,0,0,0.4);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
+    z-index: 50;
+}
+body.sessions-open .sessions-sidebar {
+    transform: none;
+}
+/* Wide screens: push the page instead of covering it. */
+@media (min-width: 1100px) {
+    body.sessions-open {
+        padding-left: 320px;
+    }
+}
+
+.sessions-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+.sessions-head h2 {
+    font-size: 1.1rem;
+    color: #8b5cf6;
+}
+.sessions-close {
+    background: none;
+    border: none;
+    color: #888;
+    font-size: 1.1rem;
+    cursor: pointer;
+}
+.sessions-close:hover {
+    color: #eee;
+}
+.session-save-btn {
+    width: 100%;
+}
+.session-save-btn:disabled {
+    opacity: 0.6;
+    cursor: wait;
+}
+
+.sessions-list {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-right: 2px;
+}
+.sessions-empty {
+    color: #888;
+    font-size: 0.85rem;
+    font-style: italic;
+    text-align: center;
+    margin-top: 20px;
+}
+
+.session-item {
+    background: #16213e;
+    border-radius: 6px;
+    padding: 8px;
+    border: 1px solid transparent;
+}
+.session-item.current {
+    border-color: #8b5cf6;
+}
+.session-thumb {
+    display: block;
+    width: 100%;
+    aspect-ratio: 292 / 220;
+    object-fit: cover;
+    border-radius: 4px;
+    background: #000;
+    cursor: pointer;
+}
+.session-thumb:hover {
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.5);
+}
+.session-name-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+}
+.session-name {
+    flex: 1;
+    font-size: 0.9rem;
+    font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.session-name-input {
+    flex: 1;
+    min-width: 0;
+    padding: 4px 6px;
+    border: 1px solid #8b5cf6;
+    border-radius: 4px;
+    background: #0d0d1a;
+    color: #eee;
+    font-size: 0.9rem;
+}
+.session-meta {
+    font-size: 0.75rem;
+    color: #888;
+    margin-top: 2px;
+}
+.session-actions {
+    display: flex;
+    gap: 5px;
+    margin-top: 6px;
+}
+.session-actions .btn {
+    padding: 5px;
+    font-size: 0.8rem;
+}
+.session-actions .btn-restore {
+    flex: 2;
+    background: #4c3a8a;
+}
+.session-actions .btn-restore:hover {
+    background: #6d52c4;
+}
+.session-actions .btn-delete:hover {
+    background: #b91c1c;
+}
+.btn-icon {
+    flex: 0 0 auto;
+    padding: 3px 6px;
+    font-size: 0.8rem;
+}

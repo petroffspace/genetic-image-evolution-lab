@@ -7869,6 +7869,7 @@ func main() {
 	http.HandleFunc("/api/undo", handleUndo)
 	http.HandleFunc("/api/get-genome", handleGetGenome)
 	http.HandleFunc("/api/features", handleFeatures)
+	registerSessionRoutes()
 
 	fmt.Printf("Genetic Image Evolution Lab\n")
 	fmt.Printf("Server listening on http://localhost:%d\n", Port)
