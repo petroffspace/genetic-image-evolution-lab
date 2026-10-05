@@ -1689,6 +1689,7 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 	child.PaletteMode = g.PaletteMode
 	child.AnchorCount = g.AnchorCount
 	child.AnchorColors = g.AnchorColors
+	child.Lch = g.Lch
 
 	// Phase realization: always the clicked parent's, so children visibly
 	// resemble the image you clicked.

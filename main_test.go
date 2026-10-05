@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"math/rand"
+	"testing"
+)
 
 // Regression test: all monotone easings must start at 0, end at 1,
 // stay inside [0,1], and never decrease.
@@ -34,6 +37,20 @@ func TestEasings(t *testing.T) {
 				t.Errorf("%s: f(%.2f) = %v outside [0,1]", name, tv, v)
 			}
 			prev = v
+		}
+	}
+}
+
+// Regression test: children of an OKLCH-palette parent must inherit its
+// Lch genes. The palette group copied PaletteMode but not Lch, so every
+// such child got a zero palette (L0 clamped to 0.1) and rendered black.
+func TestBreedInheritsLchPalette(t *testing.T) {
+	rng := rand.New(rand.NewSource(1))
+	parent := Genome{PaletteMode: 2, Lch: randomLchPalette(rng)}
+	for i := 0; i < 200; i++ {
+		child := breedGenome(parent, nil, rng, 1)
+		if child.PaletteMode == 2 && child.Lch.L0 < 0.3 {
+			t.Fatalf("child %d lost the parent's Lch palette: %+v", i, child.Lch)
 		}
 	}
 }
