@@ -240,6 +240,10 @@ func decodeBody(w http.ResponseWriter, r *http.Request, v interface{}) bool {
 
 // GET /api/sessions — the saved sessions, newest first.
 func handleSessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	list, err := listSessions()
 	if err != nil {
 		jsonError(w, "Failed to list sessions: "+err.Error(), http.StatusInternalServerError)
@@ -442,6 +446,10 @@ func handleSessionRestore(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/sessions/thumb?id=... — the session's contact-sheet JPEG.
 func handleSessionThumb(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	dir, ok := sessionDir(r.URL.Query().Get("id"))
 	if !ok {
 		http.NotFound(w, r)

@@ -217,6 +217,17 @@ func stage(name string, fn func()) {
 	pprof.Do(context.Background(), pprof.Labels("stage", name), func(context.Context) { fn() })
 }
 
+// newComplexGrid allocates a rows x cols complex128 matrix backed by a single
+// contiguous slab to avoid per-row heap allocations.
+func newComplexGrid(rows, cols int) [][]complex128 {
+	slab := make([]complex128, rows*cols)
+	grid := make([][]complex128, rows)
+	for y := 0; y < rows; y++ {
+		grid[y] = slab[y*cols : (y+1)*cols]
+	}
+	return grid
+}
+
 func nextPow2(n int) int {
 	p := 1
 	for p < n {
@@ -2083,6 +2094,28 @@ func clampF(v, lo, hi float64) float64 {
 // COLOR SPACES — sRGB / OKLab / OKLCH
 // ============================================================================
 
+// srgbByteLin precomputes exact sRGB-to-linear linearization for 8-bit channels.
+var srgbByteLin = func() (lut [256]float64) {
+	for i := range lut {
+		c := float64(i) / 255
+		if c <= 0.04045 {
+			lut[i] = c / 12.92
+		} else {
+			lut[i] = math.Pow((c+0.055)/1.055, 2.4)
+		}
+	}
+	return lut
+}()
+
+func linearToOKLab(r, g, b float64) (L, A, B float64) {
+	l := math.Cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b)
+	m := math.Cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b)
+	s := math.Cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b)
+	return 0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
+		1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
+		0.0259040371*l + 0.7827717662*m - 0.8086757660*s
+}
+
 // srgbToOKLab converts an sRGB color (0..1 per channel) to OKLab.
 func srgbToOKLab(r, g, b float64) (L, A, B float64) {
 	lin := func(c float64) float64 {
@@ -2091,13 +2124,13 @@ func srgbToOKLab(r, g, b float64) (L, A, B float64) {
 		}
 		return math.Pow((c+0.055)/1.055, 2.4)
 	}
-	r, g, b = lin(r), lin(g), lin(b)
-	l := math.Cbrt(0.4122214708*r + 0.5363325363*g + 0.0514459929*b)
-	m := math.Cbrt(0.2119034982*r + 0.6806995451*g + 0.1073969566*b)
-	s := math.Cbrt(0.0883024619*r + 0.2817188376*g + 0.6299787005*b)
-	return 0.2104542553*l + 0.7936177850*m - 0.0040720468*s,
-		1.9779984951*l - 2.4285922050*m + 0.4505937099*s,
-		0.0259040371*l + 0.7827717662*m - 0.8086757660*s
+	return linearToOKLab(lin(r), lin(g), lin(b))
+}
+
+// srgbByteToOKLab converts 8-bit sRGB channels to OKLab identically to
+// srgbToOKLab(float64(r)/255, float64(g)/255, float64(b)/255).
+func srgbByteToOKLab(rb, gb, bb uint8) (L, A, B float64) {
+	return linearToOKLab(srgbByteLin[rb], srgbByteLin[gb], srgbByteLin[bb])
 }
 
 // oklabToLinear converts OKLab to LINEAR sRGB (may fall outside [0, 1]).
@@ -2260,10 +2293,8 @@ func applyTransform(t float64, cfg Genome) float64 {
 // Since white noise already has a flat spectrum, the forward transform was
 // wasted work.)
 func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
-	data := make([][]complex128, padH)
-	for y := range data {
-		data[y] = make([]complex128, padW)
-	}
+	data := newComplexGrid(padH, padW)
+	result := make([]float64, padW*padH)
 	halfW := padW / 2
 	stretch := cfg.AxisStretch
 	// refHalf / refPadH: the tile that frequency-relative genes (BandLimit,
@@ -2350,6 +2381,10 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 	// Cone attenuation is inherited by the mirrored bin, so the cone is
 	// effectively two-lobed (theta and theta+pi) — which is what produces
 	// the streaky brushed/fabric look rather than a one-sided flow.
+	// Two-pass Hermitian fill preserves the exact sequential RNG stream
+	// while parallelizing the per-bin spectral math across rows:
+	//   Pass 1 (serial): draw and store raw bin phases into result[y*padW+x].
+	//   Pass 2 (parallel): compute amplitudes, apply motion, mirror conjugates.
 	for y := 0; y <= padH/2; y++ {
 		ym := (padH - y) % padH
 		selfRow := ym == y // rows 0 and padH/2 pair with themselves
@@ -2357,57 +2392,17 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 		if selfRow {
 			xmax = halfW
 		}
+		fv0 := freqCoord(y, padH)
 		for x := 0; x <= xmax; x++ {
 			xm := (padW - x) % padW
 			fu := freqCoord(x, padW)
-			fv := freqCoord(y, padH)
+			fv := fv0
 			if rot != 0 {
 				fu, fv = fu*cr-fv*ci, fu*ci+fv*cr
 			}
 			fvv := fv * stretch // anisotropy: directional frequency scaling
 			f := math.Sqrt(fu*fu + fvv*fvv)
-			if f < 0.5 {
-				continue // kill DC and the lowest bin
-			}
-			// Spectral breakpoint: past BreakFreq*maxFreq switch to the
-			// high-frequency exponent. This decouples large-scale billows
-			// from fine-grain roughness.
-			e := cfg.Exponent
-			if cfg.BreakFreq > 0.001 {
-				corner := float64(refHalf) * cfg.BreakFreq
-				if f > corner {
-					e = cfg.ExponentHi
-				}
-			}
-			amp := 1.0 / math.Pow(f, e/2.0)
-			for i := range spikes {
-				if spikes[i].x == x && spikes[i].y == y {
-					amp *= spikes[i].boost
-					break
-				}
-			}
-			if cfg.BandLimit > 0 {
-				maxFreq := float64(refHalf)
-				cutoff := maxFreq * cfg.BandLimit
-				if f > cutoff {
-					denom := 2 * cutoff * cutoff
-					if cfg.RenderVersion >= 7 {
-						denom = 0.5 * cutoff * cutoff
-					}
-					falloff := math.Exp(-((f - cutoff) * (f - cutoff)) / denom)
-					amp *= falloff
-				}
-			}
-			if coneOn {
-				ang := math.Atan2(fvv, fu)
-				d := math.Abs(math.Mod(ang-cfg.ConeAngle+3*math.Pi, 2*math.Pi) - math.Pi)
-				if d > halfCone {
-					amp *= math.Exp(-3.0 * (d - halfCone))
-				}
-			}
-			if selfRow && xm == x {
-				// Self-conjugate bins (DC/Nyquist corners) must be real.
-				data[y][x] = complex(amp, 0)
+			if f < 0.5 || (selfRow && xm == x) {
 				continue
 			}
 			phase := drawPhase(rng, rngSelfB, selfBlend)
@@ -2417,25 +2412,94 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 				// inverse FFT stays artifact-free at every blend value.
 				phase = lerpAngle(phase, drawPhase(rngTo, rngToB, toBlend), phaseBlend)
 			}
-			if cfg.motionFlow > 0 {
-				phase += flowTurns(x, y, f, cfg.motionFlow) * 2 * math.Pi * cfg.motionTau
-			}
-			if cfg.motionMorph > 0 {
-				phase += morphPhase(cfg.Seed, x, y, mt)
-			}
-			v := complex(amp*math.Cos(phase), amp*math.Sin(phase))
-			data[y][x] = v
-			data[ym][xm] = complex(real(v), -imag(v))
+			result[y*padW+x] = phase
 		}
 	}
 
-	fft2d(data, true)
-	result := make([]float64, padW*padH)
-	for y := 0; y < padH; y++ {
-		for x := 0; x < padW; x++ {
-			result[y*padW+x] = real(data[y][x])
+	parallelRows(padH/2+1, func(ya, yb int) {
+		for y := ya; y < yb; y++ {
+			ym := (padH - y) % padH
+			selfRow := ym == y // rows 0 and padH/2 pair with themselves
+			xmax := padW - 1
+			if selfRow {
+				xmax = halfW
+			}
+			fv0 := freqCoord(y, padH)
+			for x := 0; x <= xmax; x++ {
+				xm := (padW - x) % padW
+				fu := freqCoord(x, padW)
+				fv := fv0
+				if rot != 0 {
+					fu, fv = fu*cr-fv*ci, fu*ci+fv*cr
+				}
+				fvv := fv * stretch // anisotropy: directional frequency scaling
+				f := math.Sqrt(fu*fu + fvv*fvv)
+				if f < 0.5 {
+					continue // kill DC and the lowest bin
+				}
+				// Spectral breakpoint: past BreakFreq*maxFreq switch to the
+				// high-frequency exponent. This decouples large-scale billows
+				// from fine-grain roughness.
+				e := cfg.Exponent
+				if cfg.BreakFreq > 0.001 {
+					corner := float64(refHalf) * cfg.BreakFreq
+					if f > corner {
+						e = cfg.ExponentHi
+					}
+				}
+				amp := 1.0 / math.Pow(f, e/2.0)
+				for i := range spikes {
+					if spikes[i].x == x && spikes[i].y == y {
+						amp *= spikes[i].boost
+						break
+					}
+				}
+				if cfg.BandLimit > 0 {
+					maxFreq := float64(refHalf)
+					cutoff := maxFreq * cfg.BandLimit
+					if f > cutoff {
+						denom := 2 * cutoff * cutoff
+						if cfg.RenderVersion >= 7 {
+							denom = 0.5 * cutoff * cutoff
+						}
+						falloff := math.Exp(-((f - cutoff) * (f - cutoff)) / denom)
+						amp *= falloff
+					}
+				}
+				if coneOn {
+					ang := math.Atan2(fvv, fu)
+					d := math.Abs(math.Mod(ang-cfg.ConeAngle+3*math.Pi, 2*math.Pi) - math.Pi)
+					if d > halfCone {
+						amp *= math.Exp(-3.0 * (d - halfCone))
+					}
+				}
+				if selfRow && xm == x {
+					// Self-conjugate bins (DC/Nyquist corners) must be real.
+					data[y][x] = complex(amp, 0)
+					continue
+				}
+				phase := result[y*padW+x]
+				if cfg.motionFlow > 0 {
+					phase += flowTurns(x, y, f, cfg.motionFlow) * 2 * math.Pi * cfg.motionTau
+				}
+				if cfg.motionMorph > 0 {
+					phase += morphPhase(cfg.Seed, x, y, mt)
+				}
+				v := complex(amp*math.Cos(phase), amp*math.Sin(phase))
+				data[y][x] = v
+				data[ym][xm] = complex(real(v), -imag(v))
+			}
 		}
-	}
+	})
+
+	fft2d(data, true)
+	parallelRows(padH, func(ya, yb int) {
+		for y := ya; y < yb; y++ {
+			for x := 0; x < padW; x++ {
+				result[y*padW+x] = real(data[y][x])
+			}
+		}
+	})
 	return result
 }
 
@@ -2451,10 +2515,8 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 // inverse FFT of Z = A + iB (real part a, imaginary part b), half the
 // transform work of two FFTs. Only the FFT's rounding differs (~1e-16).
 func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cfgB Genome) ([]float64, []float64) {
-	data := make([][]complex128, padH)
-	for y := range data {
-		data[y] = make([]complex128, padW)
-	}
+	data := newComplexGrid(padH, padW)
+	a, b := make([]float64, padW*padH), make([]float64, padW*padH)
 	halfW := padW / 2
 	cfg := cfgA // shared geometry
 	stretch := cfg.AxisStretch
@@ -2492,11 +2554,14 @@ func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cf
 		}
 		return p
 	}
-	phaseOf := func(ch *channel, x, y int, f float64) float64 {
+	basePhaseOf := func(ch *channel) float64 {
 		phase := drawPhase(ch.rng, ch.selfB, ch.selfBlend)
 		if ch.to != nil {
 			phase = lerpAngle(phase, drawPhase(ch.to, ch.toB, ch.toBld), ch.phaseBlend)
 		}
+		return phase
+	}
+	motionPhaseOf := func(ch *channel, phase float64, x, y int, f float64) float64 {
 		if ch.cfg.motionFlow > 0 {
 			phase += flowTurns(x, y, f, ch.cfg.motionFlow) * 2 * math.Pi * ch.cfg.motionTau
 		}
@@ -2547,6 +2612,8 @@ func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cf
 	coneOn := cfg.ConeWidth > 0.001 && cfg.ConeWidth < 0.999
 	halfCone := cfg.ConeWidth * math.Pi
 
+	// Two-pass Hermitian fill preserves the exact sequential RNG stream
+	// while parallelizing the per-bin spectral math across rows.
 	for y := 0; y <= padH/2; y++ {
 		ym := (padH - y) % padH
 		selfRow := ym == y
@@ -2554,86 +2621,114 @@ func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cf
 		if selfRow {
 			xmax = halfW
 		}
+		fv0 := freqCoord(y, padH)
 		for x := 0; x <= xmax; x++ {
 			xm := (padW - x) % padW
 			fu := freqCoord(x, padW)
-			fv := freqCoord(y, padH)
+			fv := fv0
 			if rot != 0 {
 				fu, fv = fu*cr-fv*ci, fu*ci+fv*cr
 			}
 			fvv := fv * stretch
 			f := math.Sqrt(fu*fu + fvv*fvv)
-			if f < 0.5 {
+			if f < 0.5 || (selfRow && xm == x) {
 				continue
 			}
-			// Shared factors, applied to each channel in synthChannel's order.
-			spike, hasSpike := 1.0, false
-			for i := range spikes {
-				if spikes[i].x == x && spikes[i].y == y {
-					spike, hasSpike = spikes[i].boost, true
-					break
-				}
-			}
-			falloff, hasFalloff := 1.0, false
-			if cfg.BandLimit > 0 {
-				cutoff := float64(refHalf) * cfg.BandLimit
-				if f > cutoff {
-					denom := 2 * cutoff * cutoff
-					if cfg.RenderVersion >= 7 {
-						denom = 0.5 * cutoff * cutoff
-					}
-					falloff, hasFalloff = math.Exp(-((f-cutoff)*(f-cutoff))/denom), true
-				}
-			}
-			cone, hasCone := 1.0, false
-			if coneOn {
-				ang := math.Atan2(fvv, fu)
-				d := math.Abs(math.Mod(ang-cfg.ConeAngle+3*math.Pi, 2*math.Pi) - math.Pi)
-				if d > halfCone {
-					cone, hasCone = math.Exp(-3.0*(d-halfCone)), true
-				}
-			}
-			// f^(-e/2) as exp(-e/2 * ln f), one log shared by both channels
-			// (cheaper than Pow; differs only in rounding, like the FFT).
-			var amps [2]float64
-			lf := math.Log(f)
-			for c, ch := range chans {
-				amp := math.Exp(-exponentOf(ch.cfg, f) / 2.0 * lf)
-				if hasSpike {
-					amp *= spike
-				}
-				if hasFalloff {
-					amp *= falloff
-				}
-				if hasCone {
-					amp *= cone
-				}
-				amps[c] = amp
-			}
-			if selfRow && xm == x {
-				data[y][x] = complex(amps[0], amps[1]) // A + iB, both real
-				continue
-			}
-			var va, vb complex128
-			for c, ch := range chans {
-				sn, cs := math.Sincos(phaseOf(ch, x, y, f))
-				v := complex(amps[c]*cs, amps[c]*sn)
-				if c == 0 {
-					va = v
-				} else {
-					vb = v
-				}
-			}
-			// Z = A + iB on this bin, conj(A) + i conj(B) on its mirror.
-			iB := complex(-imag(vb), real(vb))
-			iBc := complex(imag(vb), real(vb)) // i * conj(vb)
-			data[y][x] = va + iB
-			data[ym][xm] = complex(real(va), -imag(va)) + iBc
+			a[y*padW+x] = basePhaseOf(chans[0])
+			b[y*padW+x] = basePhaseOf(chans[1])
 		}
 	}
 
+	parallelRows(padH/2+1, func(ya, yb int) {
+		for y := ya; y < yb; y++ {
+			ym := (padH - y) % padH
+			selfRow := ym == y
+			xmax := padW - 1
+			if selfRow {
+				xmax = halfW
+			}
+			fv0 := freqCoord(y, padH)
+			for x := 0; x <= xmax; x++ {
+				xm := (padW - x) % padW
+				fu := freqCoord(x, padW)
+				fv := fv0
+				if rot != 0 {
+					fu, fv = fu*cr-fv*ci, fu*ci+fv*cr
+				}
+				fvv := fv * stretch
+				f := math.Sqrt(fu*fu + fvv*fvv)
+				if f < 0.5 {
+					continue
+				}
+				// Shared factors, applied to each channel in synthChannel's order.
+				spike, hasSpike := 1.0, false
+				for i := range spikes {
+					if spikes[i].x == x && spikes[i].y == y {
+						spike, hasSpike = spikes[i].boost, true
+						break
+					}
+				}
+				falloff, hasFalloff := 1.0, false
+				if cfg.BandLimit > 0 {
+					cutoff := float64(refHalf) * cfg.BandLimit
+					if f > cutoff {
+						denom := 2 * cutoff * cutoff
+						if cfg.RenderVersion >= 7 {
+							denom = 0.5 * cutoff * cutoff
+						}
+						falloff, hasFalloff = math.Exp(-((f-cutoff)*(f-cutoff))/denom), true
+					}
+				}
+				cone, hasCone := 1.0, false
+				if coneOn {
+					ang := math.Atan2(fvv, fu)
+					d := math.Abs(math.Mod(ang-cfg.ConeAngle+3*math.Pi, 2*math.Pi) - math.Pi)
+					if d > halfCone {
+						cone, hasCone = math.Exp(-3.0*(d-halfCone)), true
+					}
+				}
+				// f^(-e/2) as exp(-e/2 * ln f), one log shared by both channels
+				// (cheaper than Pow; differs only in rounding, like the FFT).
+				var amps [2]float64
+				lf := math.Log(f)
+				for c, ch := range chans {
+					amp := math.Exp(-exponentOf(ch.cfg, f) / 2.0 * lf)
+					if hasSpike {
+						amp *= spike
+					}
+					if hasFalloff {
+						amp *= falloff
+					}
+					if hasCone {
+						amp *= cone
+					}
+					amps[c] = amp
+				}
+				if selfRow && xm == x {
+					data[y][x] = complex(amps[0], amps[1]) // A + iB, both real
+					continue
+				}
+				rawPh := [2]float64{a[y*padW+x], b[y*padW+x]}
+				var va, vb complex128
+				for c, ch := range chans {
+					sn, cs := math.Sincos(motionPhaseOf(ch, rawPh[c], x, y, f))
+					v := complex(amps[c]*cs, amps[c]*sn)
+					if c == 0 {
+						va = v
+					} else {
+						vb = v
+					}
+				}
+				// Z = A + iB on this bin, conj(A) + i conj(B) on its mirror.
+				iB := complex(-imag(vb), real(vb))
+				iBc := complex(imag(vb), real(vb)) // i * conj(vb)
+				data[y][x] = va + iB
+				data[ym][xm] = complex(real(va), -imag(va)) + iBc
+			}
+		}
+	})
+
 	fft2d(data, true)
-	a, b := make([]float64, padW*padH), make([]float64, padW*padH)
 	parallelRows(padH, func(ya, yb int) {
 		for y := ya; y < yb; y++ {
 			for x := 0; x < padW; x++ {
@@ -3447,9 +3542,8 @@ func newTileWarp(cfg Genome, tile int) *tileWarp {
 // normalized to zero mean and unit standard deviation.
 func warpNoise(seed int64, scale float64, n int) []float64 {
 	rng := rand.New(rand.NewSource(seed))
-	data := make([][]complex128, n)
+	data := newComplexGrid(n, n)
 	for y := range data {
-		data[y] = make([]complex128, n)
 		for x := range data[y] {
 			fu, fv := freqCoord(x, n), freqCoord(y, n)
 			f := math.Hypot(fu, fv)
@@ -3913,6 +4007,9 @@ func normalizeRegion(data []float64, mode int, nc normCtl) []float64 {
 			idx[i] = i
 		}
 		sort.Slice(idx, func(a, b int) bool { return data[idx[a]] < data[idx[b]] })
+		if nc.capture != nil && len(idx) > 0 {
+			nc.capture[0], nc.capture[1] = data[idx[0]], data[idx[len(idx)-1]]
+		}
 		den := float64(len(data) - 1)
 		if den < 1 {
 			den = 1
@@ -4417,10 +4514,7 @@ func estimateExponent(img *image.RGBA) float64 {
 	h := img.Bounds().Dy()
 	padW := nextPow2(w)
 	padH := nextPow2(h)
-	grayData := make([][]complex128, padH)
-	for y := 0; y < padH; y++ {
-		grayData[y] = make([]complex128, padW)
-	}
+	grayData := newComplexGrid(padH, padW)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			r, g, b, _ := img.At(x, y).RGBA()
@@ -4503,9 +4597,9 @@ func perturbGenome(g Genome, rng *rand.Rand) Genome {
 	step := rng.Float64()*2 - 1
 	switch rng.Intn(17) {
 	case 0:
-		candidate.Exponent = clampF(candidate.Exponent+step*0.3, 0.5, 10.0)
+		candidate.Exponent = clampF(candidate.Exponent+step*0.3, 1.8, 4.5)
 	case 1:
-		candidate.BandLimit = clampF(candidate.BandLimit+step*0.1, 0.01, 1.0)
+		candidate.BandLimit = clampF(candidate.BandLimit+step*0.1, 0.08, 0.65)
 	case 2:
 		candidate.AxisStretch = clampF(candidate.AxisStretch+step*0.15, 0.25, 4.0)
 	case 3:
@@ -4519,15 +4613,15 @@ func perturbGenome(g Genome, rng *rand.Rand) Genome {
 		candidate.PalC = jitter3(candidate.PalC, 0.05, rng)
 		candidate.PalD = jitter3(candidate.PalD, 0.05, rng)
 	case 7:
-		candidate.ExponentHi = clampF(candidate.ExponentHi+step*0.3, 0.5, 10.0)
+		candidate.ExponentHi = clampF(candidate.ExponentHi+step*0.3, 2.2, 10.0)
 		candidate.BreakFreq = clampF(candidate.BreakFreq+step*0.08, 0.0, 0.9)
 	case 7 + 1:
-		candidate.ReliefAngle += step * 0.4
-		candidate.ReliefStrength = clampF(candidate.ReliefStrength+step*0.1, 0, 2)
+		candidate.ReliefAngle = math.Mod(candidate.ReliefAngle+step*0.4+2*math.Pi, 2*math.Pi)
+		candidate.ReliefStrength = clampF(candidate.ReliefStrength+step*0.1, 0, 0.6)
 	case 9:
 		candidate.Transform = rng.Intn(4)
-		if candidate.Transform == 2 || candidate.Transform == 3 {
-			candidate.TerraceLevels = 3.0 + rng.Float64()*12.0
+		if candidate.Transform == 3 && candidate.TerraceLevels < 3.0 {
+			candidate.TerraceLevels = 3.0 + rng.Float64()*9.0
 		}
 	case 10:
 		candidate.SpikeCount = 1 + rng.Intn(4)
@@ -4554,19 +4648,17 @@ func perturbGenome(g Genome, rng *rand.Rand) Genome {
 			candidate.SymmetryMirror = !candidate.SymmetryMirror
 		}
 	case 16:
-		candidate.PaletteMode = rng.Intn(2)
+		candidate.PaletteMode = rng.Intn(3)
 		if candidate.PaletteMode == 1 && candidate.AnchorCount < 2 {
-			candidate.AnchorCount = 2 + rng.Intn(4)
-			for k := 0; k < candidate.AnchorCount; k++ {
-				for i := 0; i < 3; i++ {
-					candidate.AnchorColors[k][i] = rng.Float64()
-				}
-			}
+			randomizeAnchors(&candidate, rng)
+		} else if candidate.PaletteMode == 2 && candidate.Lch.L0 == 0 {
+			candidate.Lch = randomLchPalette(rng)
 		}
 	}
 	if rng.Float64() < 0.1 {
 		candidate.Seed = rng.Int63()
 	}
+	applyFeatures(&candidate)
 	return candidate
 }
 
@@ -4587,10 +4679,7 @@ func estimateAxisStretch(img *image.RGBA) float64 {
 	w := img.Bounds().Dx()
 	h := img.Bounds().Dy()
 	padW, padH := nextPow2(w), nextPow2(h)
-	data := make([][]complex128, padH)
-	for y := 0; y < padH; y++ {
-		data[y] = make([]complex128, padW)
-	}
+	data := newComplexGrid(padH, padW)
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			r, g, b, _ := img.At(x, y).RGBA()
@@ -4738,7 +4827,7 @@ func analyzeGenome(target *image.RGBA) Genome {
 	palA, palB, palC, palD, gamma := fitPaletteGamma(pts)
 	return Genome{
 		Seed:          0,
-		Exponent:      estimateExponent(target),
+		Exponent:      clampF(estimateExponent(target), 1.8, 4.5),
 		BandLimit:     0.6,
 		AxisStretch:   estimateAxisStretch(target),
 		Gamma:         gamma,
@@ -4746,6 +4835,7 @@ func analyzeGenome(target *image.RGBA) Genome {
 		MutationRate:  0,
 		MutationPower: 0,
 		PalA:          palA, PalB: palB, PalC: palC, PalD: palD,
+		RenderVersion: renderVersion,
 	}
 }
 
@@ -4813,10 +4903,7 @@ func synthMatchChannel(width, height int, cfg Genome) []float64 {
 	padSrcW := nextPow2(lw)
 	padSrcH := nextPow2(lh)
 
-	data := make([][]complex128, padSrcH)
-	for y := 0; y < padSrcH; y++ {
-		data[y] = make([]complex128, padSrcW)
-	}
+	data := newComplexGrid(padSrcH, padSrcW)
 
 	zoom := cfg.zoom()
 	cosR, sinR := math.Cos(-cfg.Rot), math.Sin(-cfg.Rot)
@@ -4877,34 +4964,95 @@ func synthMatchChannel(width, height int, cfg Genome) []float64 {
 	if cfg.PhaseJitter > 0 {
 		jitRng = rand.New(rand.NewSource(cfg.Seed))
 	}
-	for y := 0; y < padSrcH; y++ {
-		for x := 0; x < padSrcW; x++ {
-			re, im := real(data[y][x]), imag(data[y][x])
-			origMag := math.Hypot(re, im)
-			if origMag < 1e-12 {
-				continue
+	if cfg.RenderVersion >= 7 {
+		srot := cfg.SpecRot
+		scr, sci := math.Cos(srot), math.Sin(srot)
+		stretch := cfg.AxisStretch
+		if stretch < 0.01 {
+			stretch = 1.0
+		}
+		halfW := padSrcW / 2
+		for y := 0; y <= padSrcH/2; y++ {
+			ym := (padSrcH - y) % padSrcH
+			selfRow := ym == y
+			xmax := padSrcW - 1
+			if selfRow {
+				xmax = halfW
 			}
-			fu := freqCoord(x, padSrcW)
-			fv := freqCoord(y, padSrcH)
-			fvv := fv * cfg.AxisStretch
-			f := math.Sqrt(fu*fu + fvv*fvv)
-
-			targetAmp := origMag
-			if f >= 0.5 {
-				desired := 1.0 / math.Pow(f, cfg.Exponent/2.0)
-				targetAmp = (origMag + desired) / 2.0
-			}
-			if cfg.BandLimit > 0 {
-				cutoff := float64(padSrcW/2) * cfg.BandLimit
-				if f > cutoff {
-					targetAmp *= math.Exp(-((f - cutoff) * (f - cutoff)) / (2 * cutoff * cutoff))
+			for x := 0; x <= xmax; x++ {
+				xm := (padSrcW - x) % padSrcW
+				re, im := real(data[y][x]), imag(data[y][x])
+				origMag := math.Hypot(re, im)
+				if origMag < 1e-12 {
+					continue
 				}
+				fu := freqCoord(x, padSrcW)
+				fv := freqCoord(y, padSrcH)
+				if srot != 0 {
+					fu, fv = fu*scr-fv*sci, fu*sci+fv*scr
+				}
+				fvv := fv * stretch
+				f := math.Sqrt(fu*fu + fvv*fvv)
+
+				targetAmp := origMag
+				if f >= 0.5 {
+					e := cfg.Exponent
+					if cfg.BreakFreq > 0.001 && f > float64(halfW)*cfg.BreakFreq {
+						e = cfg.ExponentHi
+					}
+					desired := 1.0 / math.Pow(f, e/2.0)
+					targetAmp = (origMag + desired) / 2.0
+				}
+				if cfg.BandLimit > 0 {
+					cutoff := float64(halfW) * cfg.BandLimit
+					if f > cutoff {
+						targetAmp *= math.Exp(-((f - cutoff) * (f - cutoff)) / (0.5 * cutoff * cutoff))
+					}
+				}
+				ph := math.Atan2(im, re) * mix
+				if selfRow && xm == x {
+					data[y][x] = complex(targetAmp*math.Cos(ph), 0)
+					continue
+				}
+				if jitRng != nil {
+					ph += (jitRng.Float64()*2 - 1) * cfg.PhaseJitter
+				}
+				sn, cs := math.Sincos(ph)
+				v := complex(targetAmp*cs, targetAmp*sn)
+				data[y][x] = v
+				data[ym][xm] = complex(real(v), -imag(v))
 			}
-			ph := math.Atan2(im, re) * mix
-			if jitRng != nil {
-				ph += (jitRng.Float64()*2 - 1) * cfg.PhaseJitter
+		}
+	} else {
+		for y := 0; y < padSrcH; y++ {
+			for x := 0; x < padSrcW; x++ {
+				re, im := real(data[y][x]), imag(data[y][x])
+				origMag := math.Hypot(re, im)
+				if origMag < 1e-12 {
+					continue
+				}
+				fu := freqCoord(x, padSrcW)
+				fv := freqCoord(y, padSrcH)
+				fvv := fv * cfg.AxisStretch
+				f := math.Sqrt(fu*fu + fvv*fvv)
+
+				targetAmp := origMag
+				if f >= 0.5 {
+					desired := 1.0 / math.Pow(f, cfg.Exponent/2.0)
+					targetAmp = (origMag + desired) / 2.0
+				}
+				if cfg.BandLimit > 0 {
+					cutoff := float64(padSrcW/2) * cfg.BandLimit
+					if f > cutoff {
+						targetAmp *= math.Exp(-((f - cutoff) * (f - cutoff)) / (2 * cutoff * cutoff))
+					}
+				}
+				ph := math.Atan2(im, re) * mix
+				if jitRng != nil {
+					ph += (jitRng.Float64()*2 - 1) * cfg.PhaseJitter
+				}
+				data[y][x] = complex(targetAmp*math.Cos(ph), targetAmp*math.Sin(ph))
 			}
-			data[y][x] = complex(targetAmp*math.Cos(ph), targetAmp*math.Sin(ph))
 		}
 	}
 	fft2d(data, true)
@@ -5123,7 +5271,7 @@ func reverseEngineerEstimate(target *image.RGBA, fineTuneIter int) (Genome, floa
 
 	genome := Genome{
 		Seed:          time.Now().UnixNano(),
-		Exponent:      tgtExp,
+		Exponent:      clampF(tgtExp, 1.8, 4.5),
 		BandLimit:     0.5,
 		AxisStretch:   1.0,
 		Gamma:         1.0,
@@ -5133,10 +5281,11 @@ func reverseEngineerEstimate(target *image.RGBA, fineTuneIter int) (Genome, floa
 		// Neutral grayscale ramp (0.5 - 0.5*cos(pi*t)) as the starting
 		// palette. Left zeroed, the cosine palette is solid black, so the
 		// search started from (and mostly stayed at) a near-black image.
-		PalA: [3]float64{0.5, 0.5, 0.5},
-		PalB: [3]float64{0.5, 0.5, 0.5},
-		PalC: [3]float64{0.5, 0.5, 0.5},
-		PalD: [3]float64{0.5, 0.5, 0.5},
+		PalA:          [3]float64{0.5, 0.5, 0.5},
+		PalB:          [3]float64{0.5, 0.5, 0.5},
+		PalC:          [3]float64{0.5, 0.5, 0.5},
+		PalD:          [3]float64{0.5, 0.5, 0.5},
+		RenderVersion: renderVersion,
 	}
 
 	searchRng := rand.New(rand.NewSource(time.Now().UnixNano()))
@@ -5645,12 +5794,14 @@ func blendImages(a, b *image.RGBA, t float64) *image.RGBA {
 	bp := b.Pix
 	op := out.Pix
 
-	for i := 0; i < len(ap); i += 4 {
-		op[i] = uint8(float32(ap[i])*ta + float32(bp[i])*tb)
-		op[i+1] = uint8(float32(ap[i+1])*ta + float32(bp[i+1])*tb)
-		op[i+2] = uint8(float32(ap[i+2])*ta + float32(bp[i+2])*tb)
-		op[i+3] = 255
-	}
+	parallelRows(h, func(y0, y1 int) {
+		for i := y0 * w * 4; i < y1*w*4; i += 4 {
+			op[i] = uint8(float32(ap[i])*ta + float32(bp[i])*tb)
+			op[i+1] = uint8(float32(ap[i+1])*ta + float32(bp[i+1])*tb)
+			op[i+2] = uint8(float32(ap[i+2])*ta + float32(bp[i+2])*tb)
+			op[i+3] = 255
+		}
+	})
 	return out
 }
 
@@ -5827,24 +5978,28 @@ func blurPlane(p []float64, w, h int, sigma float64) []float64 {
 	}
 	tmp := make([]float64, w*h)
 	out := make([]float64, w*h)
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			acc := 0.0
-			for i := -r; i <= r; i++ {
-				acc += k[i+r] * p[y*w+minInt(maxInt(x+i, 0), w-1)]
+	parallelRows(h, func(y0, y1 int) {
+		for y := y0; y < y1; y++ {
+			for x := 0; x < w; x++ {
+				acc := 0.0
+				for i := -r; i <= r; i++ {
+					acc += k[i+r] * p[y*w+minInt(maxInt(x+i, 0), w-1)]
+				}
+				tmp[y*w+x] = acc
 			}
-			tmp[y*w+x] = acc
 		}
-	}
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			acc := 0.0
-			for i := -r; i <= r; i++ {
-				acc += k[i+r] * tmp[minInt(maxInt(y+i, 0), h-1)*w+x]
+	})
+	parallelRows(h, func(y0, y1 int) {
+		for y := y0; y < y1; y++ {
+			for x := 0; x < w; x++ {
+				acc := 0.0
+				for i := -r; i <= r; i++ {
+					acc += k[i+r] * tmp[minInt(maxInt(y+i, 0), h-1)*w+x]
+				}
+				out[y*w+x] = acc
 			}
-			out[y*w+x] = acc
 		}
-	}
+	})
 	return out
 }
 
@@ -5866,21 +6021,33 @@ func halveFlowImage(fi flowImage) flowImage {
 // trick that keeps Horn-Schunck from smearing bad matches outward).
 func median3x3(p []float64, w, h int) []float64 {
 	out := make([]float64, w*h)
-	var win [9]float64
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			n := 0
-			for dy := -1; dy <= 1; dy++ {
-				for dx := -1; dx <= 1; dx++ {
-					win[n] = p[minInt(maxInt(y+dy, 0), h-1)*w+minInt(maxInt(x+dx, 0), w-1)]
-					n++
-				}
+	parallelRows(h, func(y0, y1 int) {
+		var win [9]float64
+		sw := func(a, b int) {
+			if win[a] > win[b] {
+				win[a], win[b] = win[b], win[a]
 			}
-			s := win[:]
-			sort.Float64s(s)
-			out[y*w+x] = s[4]
 		}
-	}
+		for y := y0; y < y1; y++ {
+			for x := 0; x < w; x++ {
+				n := 0
+				for dy := -1; dy <= 1; dy++ {
+					for dx := -1; dx <= 1; dx++ {
+						win[n] = p[minInt(maxInt(y+dy, 0), h-1)*w+minInt(maxInt(x+dx, 0), w-1)]
+						n++
+					}
+				}
+				sw(1, 2); sw(4, 5); sw(7, 8)
+				sw(0, 1); sw(3, 4); sw(6, 7)
+				sw(1, 2); sw(4, 5); sw(7, 8)
+				sw(0, 3); sw(3, 6)
+				sw(5, 8); sw(2, 5)
+				sw(1, 4); sw(4, 7); sw(1, 4)
+				sw(4, 6); sw(2, 4); sw(4, 6)
+				out[y*w+x] = win[4]
+			}
+		}
+	})
 	return out
 }
 
@@ -6610,6 +6777,13 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 						interp.tileCache = nil // interpolated genes: nothing to share
 						interp.normLo = ga.normLo + (gb.normLo-ga.normLo)*e
 						interp.normHi = ga.normHi + (gb.normHi-ga.normHi)*e
+						if interp.NormMode == 2 && len(ga.normQuant) > 0 && len(gb.normQuant) == len(ga.normQuant) {
+							q := make([]float64, len(ga.normQuant))
+							for qi := range q {
+								q[qi] = ga.normQuant[qi] + (gb.normQuant[qi]-ga.normQuant[qi])*e
+							}
+							interp.normQuant = q
+						}
 						if classic {
 							interp.phaseTo, interp.phaseBlend = gb.phases(), e
 						}
@@ -6670,21 +6844,17 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 		// SHAPE MORPH MODE: prepare each keyframe's structure field once,
 		// compute the flow pair for the current segment, then synthesize
 		// every in-between (see morphFrame). Only the current segment's
-		// two keyframes are held, and B is reused as the next A. Fields
-		// use the same 2x supersampled canvas as renderExactFramed, so
-		// keyframes match the other modes' endpoint renders exactly.
-		cw, ch := req.Width*2, req.Height*2
-		if cw > 8192 || ch > 8192 {
-			cw, ch = req.Width, req.Height
-		}
-
+		// two keyframes are held, and B is reused as the next A when its
+		// supersampled canvas matches.
 		curSeg := -1
 		var keyA, keyB *morphKey
 		var fab, fba flowField
 		for frame := 0; frame < req.Frames; frame++ {
 			seg, t := segmentAt(frame)
 			if seg != curSeg {
-				if keyB != nil && seg == curSeg+1 {
+				ss := supersampleFactor(genomes[seg], fieldTile, req.Width, req.Height)
+				cw, ch := req.Width*ss, req.Height*ss
+				if keyB != nil && seg == curSeg+1 && keyB.w == cw && keyB.h == ch {
 					keyA = keyB
 				} else {
 					keyA = newMorphKey(genomes[seg], req.Width, req.Height, cw, ch)
@@ -7079,6 +7249,10 @@ func handleStatic(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleGrid(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	state.mu.RLock()
 	defer state.mu.RUnlock()
 	cells := make([]map[string]interface{}, totalCells)
@@ -7101,6 +7275,10 @@ func handleGrid(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleEvolve(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		ClickedIndex int `json:"clicked_index"`
 	}
@@ -7111,59 +7289,67 @@ func handleEvolve(w http.ResponseWriter, r *http.Request) {
 	if !validCell(w, req.ClickedIndex) {
 		return
 	}
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	parentGenome := state.cells[req.ClickedIndex].Genome
 
+	state.mu.RLock()
+	parentGenome := state.cells[req.ClickedIndex].Genome
 	// Locked cells act as co-parents: their genes flow into the children.
 	donors := make([]Genome, 0, totalCells)
-	for i := 0; i < totalCells; i++ {
-		if i != req.ClickedIndex && state.cells[i].Locked {
-			donors = append(donors, state.cells[i].Genome)
-		}
-	}
-
-	allLocked := true
-	for i := 0; i < totalCells; i++ {
-		if i != req.ClickedIndex && !state.cells[i].Locked {
-			allLocked = false
-			break
-		}
-	}
-	if allLocked {
-		jsonError(w, "All other cells are locked — unlock at least one to evolve", http.StatusConflict)
-		return
-	}
 	free := make([]int, 0, totalCells)
 	for i := 0; i < totalCells; i++ {
-		if i != req.ClickedIndex && !state.cells[i].Locked {
+		if i == req.ClickedIndex {
+			continue
+		}
+		if state.cells[i].Locked {
+			donors = append(donors, state.cells[i].Genome)
+		} else {
 			free = append(free, i)
 		}
 	}
+	state.mu.RUnlock()
+
+	if len(free) == 0 {
+		jsonError(w, "All other cells are locked — unlock at least one to evolve", http.StatusConflict)
+		return
+	}
 	strengths := slotStrengths(len(free))
+	childGenomes := make([]Genome, len(free))
+	childImages := make([]string, len(free))
 	var wg sync.WaitGroup
 	for slot, i := range free {
 		wg.Add(1)
-		go func(idx int, strength float64) {
+		go func(slot, idx int, strength float64) {
 			defer wg.Done()
 			mutRng := rand.New(rand.NewSource(time.Now().UnixNano() + int64(idx)*1000000))
 			childGenome := breedGenome(parentGenome, donors, mutRng, strength)
 			applyFeatures(&childGenome)
 			img := renderGridPreview(childGenome)
-			state.pushHistoryLocked(idx)
-			state.cells[idx].Genome = childGenome
-			state.cells[idx].Image = imgToBase64(img)
-			state.cells[idx].Strength = strength
-		}(i, strengths[slot])
+			childGenomes[slot] = childGenome
+			childImages[slot] = imgToBase64(img)
+		}(slot, i, strengths[slot])
 	}
 	wg.Wait()
+
+	state.mu.Lock()
+	for slot, idx := range free {
+		if state.cells[idx].Locked {
+			continue
+		}
+		state.pushHistoryLocked(idx)
+		state.cells[idx].Genome = childGenomes[slot]
+		state.cells[idx].Image = childImages[slot]
+		state.cells[idx].Strength = strengths[slot]
+	}
+	state.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "evolved"})
 }
 
 func handleGenerateAll(w http.ResponseWriter, r *http.Request) {
-	state.mu.Lock()
-	defer state.mu.Unlock()
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	state.mu.RLock()
 	var free []int
 	var locked []Genome
 	for i, c := range state.cells {
@@ -7173,19 +7359,35 @@ func handleGenerateAll(w http.ResponseWriter, r *http.Request) {
 			free = append(free, i)
 		}
 	}
-	seeded := seedPopulation(len(free), locked, rand.New(rand.NewSource(time.Now().UnixNano())))
-	parallelMap(len(seeded), func(k int) {
-		idx := free[k]
-		state.pushHistoryLocked(idx)
-		state.cells[idx].Genome = seeded[k].genome
-		state.cells[idx].Image = imgToBase64(seeded[k].image)
-		state.cells[idx].Strength = 0
-	})
+	state.mu.RUnlock()
+
+	if len(free) > 0 {
+		seeded := seedPopulation(len(free), locked, rand.New(rand.NewSource(time.Now().UnixNano())))
+		images := make([]string, len(seeded))
+		parallelMap(len(seeded), func(k int) {
+			images[k] = imgToBase64(seeded[k].image)
+		})
+		state.mu.Lock()
+		for k, idx := range free {
+			if state.cells[idx].Locked {
+				continue
+			}
+			state.pushHistoryLocked(idx)
+			state.cells[idx].Genome = seeded[k].genome
+			state.cells[idx].Image = images[k]
+			state.cells[idx].Strength = 0
+		}
+		state.mu.Unlock()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{"status": "generated"})
 }
 
 func handleToggleLock(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Index int `json:"index"`
 	}
@@ -7205,6 +7407,10 @@ func handleToggleLock(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSaveImage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Index int    `json:"index"`
 		Size  string `json:"size"`
@@ -7313,6 +7519,10 @@ func handleRenderImage(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSaveParams(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Index int    `json:"index"`
 		Dir   string `json:"dir"`
@@ -7322,6 +7532,14 @@ func handleSaveParams(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !validCell(w, req.Index) {
+		return
+	}
+	saveDir := req.Dir
+	if saveDir == "" {
+		saveDir = state.genomeDir
+	}
+	if info, err := os.Stat(saveDir); err != nil || !info.IsDir() {
+		jsonError(w, "Directory does not exist", http.StatusBadRequest)
 		return
 	}
 	state.mu.RLock()
@@ -7334,10 +7552,6 @@ func handleSaveParams(w http.ResponseWriter, r *http.Request) {
 		Genome:    g,
 	}
 	jsonData, _ := json.MarshalIndent(saved, "", "  ")
-	saveDir := req.Dir
-	if saveDir == "" {
-		saveDir = state.genomeDir
-	}
 	timestamp := time.Now().Format("20060102_150405")
 	filename := filepath.Join(saveDir, fmt.Sprintf("genome_%04d_%s.json", req.Index, timestamp))
 	if err := os.WriteFile(filename, jsonData, 0644); err != nil {
@@ -7349,6 +7563,10 @@ func handleSaveParams(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleLoadParams(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	// New flow: client picked the file itself and sends its contents.
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
 		var req struct {
@@ -7517,6 +7735,10 @@ func handleUploadImage(w http.ResponseWriter, r *http.Request) {
 // handleUndo pops the most recent genome from a cell's undo stack and
 // reinstates it.
 func handleUndo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Index int `json:"index"`
 	}
@@ -7552,6 +7774,10 @@ func handleUndo(w http.ResponseWriter, r *http.Request) {
 // The grid endpoint strips the reference to keep responses light; saving
 // parameters needs it, so the client fetches it on demand.
 func handleGetGenome(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	var req struct {
 		Index int `json:"index"`
 	}
@@ -7619,14 +7845,14 @@ func measureImage(img *image.RGBA) imageStats {
 	n := float64(w * h)
 	lab := make([][3]float64, w*h)
 	var st imageStats
-	fine := make(map[int]int)
+	var fine [4096]int
 	var coarse [512]int
 	var sum, sum2 [3]float64
 	for y := 0; y < h; y++ {
 		for x := 0; x < w; x++ {
 			o := img.PixOffset(x, y)
 			r, g, b := img.Pix[o], img.Pix[o+1], img.Pix[o+2]
-			L, A, B := srgbToOKLab(float64(r)/255, float64(g)/255, float64(b)/255)
+			L, A, B := srgbByteToOKLab(r, g, b)
 			lab[y*w+x] = [3]float64{L, A, B}
 			for c, v := range lab[y*w+x] {
 				sum[c] += v
@@ -7646,8 +7872,10 @@ func measureImage(img *image.RGBA) imageStats {
 	}
 	st.contrast = math.Sqrt(math.Max(0, variance))
 	for _, c := range fine {
-		p := float64(c) / n
-		st.entropy -= p * math.Log2(p)
+		if c > 0 {
+			p := float64(c) / n
+			st.entropy -= p * math.Log2(p)
+		}
 	}
 	for _, c := range coarse {
 		st.dominant = math.Max(st.dominant, float64(c)/n)

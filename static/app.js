@@ -175,7 +175,8 @@ function previewMotionFor(dir) {
 }
 
 async function fetchPreviewFrames(index, motion) {
-    const key = JSON.stringify([gridData[index].genome, motion]);
+    const imgFP = (gridData[index].image || '').slice(-32);
+    const key = JSON.stringify([gridData[index].genome, motion, imgFP]);
     let frames = previewCache.get(key);
     if (!frames) {
         frames = (await postJSON('/api/preview-motion', { index, motion })).frames;

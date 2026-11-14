@@ -2060,3 +2060,168 @@ func TestDenoisedPopulationGrainMetrics(t *testing.T) {
 	}
 	t.Logf("50 seeded genomes: mean grad = %.2f (range [%.2f, %.2f]), max lap/grad = %.3f", meanGrad, minGrad, maxGrad, maxRatio)
 }
+
+func TestNormMode2TimelineParamsTransition(t *testing.T) {
+	data := make([]float64, 64*48)
+	for i := range data {
+		data[i] = float64(i)*0.01 - 10.0
+	}
+	var rng [2]float64
+	var q []float64
+	normalizeRegion(data, 2, normCtl{capture: &rng, captureQuant: &q})
+	if rng[0] >= rng[1] {
+		t.Fatalf("mode 2 normalizeRegion did not capture range: got %v", rng)
+	}
+	if len(q) != rankQuantiles+1 {
+		t.Fatalf("mode 2 captureQuant len = %d, want %d", len(q), rankQuantiles+1)
+	}
+
+	state = NewAppState(t.TempDir())
+	r := rand.New(rand.NewSource(99))
+	for i, nm := range []int{0, 2, 2} {
+		g := randomGenome(r)
+		g.RD.Mode = 0
+		g.Layer.Mode = 0
+		g.NormMode = nm
+		state.cells[i].Genome = g
+	}
+	code, errMsg, imgs := runAnimation(t, map[string]interface{}{
+		"source_cells":      []int{0, 1, 2},
+		"hold_frames":       2,
+		"transition_frames": 4,
+		"fps":               24,
+		"width":             64,
+		"height":            48,
+		"mode":              "params",
+	})
+	if code != 200 {
+		t.Fatalf("runAnimation failed (%d): %s", code, errMsg)
+	}
+	if len(imgs) != 14 {
+		t.Fatalf("got %d frames, want 14", len(imgs))
+	}
+	for f, im := range imgs {
+		if st := measureImage(im); st.contrast <= 0.01 {
+			t.Errorf("frame %d collapsed to flat contrast %.4f", f, st.contrast)
+		}
+	}
+	// Transition between two NormMode==2 cells (frames 8..11) should progress smoothly.
+	if bytes.Equal(imgs[8].Pix, imgs[9].Pix) {
+		t.Error("NormMode==2 -> NormMode==2 params transition stalled between transition frames")
+	}
+}
+
+func TestReverseEngineerUsesCurrentRenderVersionAndBounds(t *testing.T) {
+	base := Genome{
+		Seed: 1234, Exponent: 2.6, BandLimit: 0.45, AxisStretch: 1.0,
+		Gamma: 1.0, Colorfulness: 0.7, ConeWidth: 1.0,
+		PalA: [3]float64{0.5, 0.5, 0.5}, PalB: [3]float64{0.4, 0.4, 0.4},
+		PalC: [3]float64{1.0, 1.0, 0.5}, PalD: [3]float64{0.1, 0.3, 0.6},
+		RenderVersion: renderVersion,
+	}
+	target := renderClean(base, 64, 48)
+
+	checkGenome := func(name string, g Genome) {
+		t.Helper()
+		if g.RenderVersion != renderVersion {
+			t.Errorf("%s: RenderVersion = %d, want %d", name, g.RenderVersion, renderVersion)
+		}
+		if g.Exponent < 1.8 || g.Exponent > 4.5 {
+			t.Errorf("%s: Exponent = %.3f outside [1.8, 4.5]", name, g.Exponent)
+		}
+	}
+
+	gAnalyze := analyzeGenome(target)
+	checkGenome("analyzeGenome", gAnalyze)
+
+	gEst, _ := reverseEngineerEstimate(target, 5)
+	checkGenome("reverseEngineerEstimate", gEst)
+
+	gPrec, _ := reverseEngineerPrecise(target, 5)
+	checkGenome("reverseEngineerPrecise", gPrec)
+
+	gMatch, _ := reverseEngineerMatch(target, 3)
+	checkGenome("reverseEngineerMatch", gMatch)
+
+	g := gAnalyze
+	g.ExponentHi = 2.5
+	prng := rand.New(rand.NewSource(77))
+	sawLCH := false
+	for i := 0; i < 400; i++ {
+		g = perturbGenome(g, prng)
+		if g.Exponent < 1.8 || g.Exponent > 4.5 {
+			t.Fatalf("perturbGenome step %d: Exponent %.3f outside [1.8, 4.5]", i, g.Exponent)
+		}
+		if g.BandLimit < 0.08 || g.BandLimit > 0.65 {
+			t.Fatalf("perturbGenome step %d: BandLimit %.3f outside [0.08, 0.65]", i, g.BandLimit)
+		}
+		if g.ExponentHi < 2.2 || g.ExponentHi > 10.0 {
+			t.Fatalf("perturbGenome step %d: ExponentHi %.3f outside [2.2, 10.0]", i, g.ExponentHi)
+		}
+		if g.ReliefStrength < 0 || g.ReliefStrength > 0.6 {
+			t.Fatalf("perturbGenome step %d: ReliefStrength %.3f outside [0, 0.6]", i, g.ReliefStrength)
+		}
+		if g.PaletteMode == 2 {
+			sawLCH = true
+		}
+	}
+	if !sawLCH {
+		t.Error("perturbGenome never visited PaletteMode == 2 (OKLCH) in 400 steps")
+	}
+}
+
+func TestMatchModeHermitianSymmetry(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 64, 48))
+	for y := 0; y < 48; y++ {
+		for x := 0; x < 64; x++ {
+			v := uint8(128 + 80*math.Sin(float64(x)*0.25)*math.Cos(float64(y)*0.2))
+			o := src.PixOffset(x, y)
+			src.Pix[o], src.Pix[o+1], src.Pix[o+2], src.Pix[o+3] = v, v, v, 255
+		}
+	}
+	b64, lw, lh := extractLumaRef(src, 64, 48)
+	base := Genome{
+		Seed: 42, Exponent: 2.4, ExponentHi: 4.5, BreakFreq: 0.35,
+		BandLimit: 0.5, AxisStretch: 2.0, Gamma: 1.0, Colorfulness: 0.6,
+		ConeWidth: 1.0, PhaseMix: 1.0, PhaseJitter: 0.5, SpecRot: 0.0,
+		PalA: [3]float64{0.5, 0.5, 0.5}, PalB: [3]float64{0.5, 0.5, 0.5},
+		PalC: [3]float64{1.0, 1.0, 0.5}, PalD: [3]float64{0.1, 0.3, 0.7},
+		LumaRef: b64, LumaW: lw, LumaH: lh,
+		RenderVersion: renderVersion,
+	}
+
+	f0 := synthMatchChannel(64, 48, base)
+	if len(f0) == 0 {
+		t.Fatal("synthMatchChannel returned nil/empty")
+	}
+	mn, mx := minMax(f0)
+	if math.IsNaN(mn) || math.IsNaN(mx) || mx <= mn {
+		t.Fatalf("invalid match field range: [%v, %v]", mn, mx)
+	}
+
+	rot := base
+	rot.SpecRot = 0.7
+	fRot := synthMatchChannel(64, 48, rot)
+	rotDiff := 0.0
+	for i := range f0 {
+		rotDiff += math.Abs(f0[i] - fRot[i])
+	}
+	if rotDiff < 1e-3 {
+		t.Errorf("SpecRot did not change match field (diff=%.6f)", rotDiff)
+	}
+
+	hi := base
+	hi.ExponentHi = 8.0
+	fHi := synthMatchChannel(64, 48, hi)
+	hiDiff := 0.0
+	for i := range f0 {
+		hiDiff += math.Abs(f0[i] - fHi[i])
+	}
+	if hiDiff < 1e-3 {
+		t.Errorf("BreakFreq/ExponentHi did not change match field (diff=%.6f)", hiDiff)
+	}
+
+	if img := renderClean(base, 64, 48); measureImage(img).contrast <= 0.01 {
+		t.Error("match-mode render with PhaseJitter produced flat image")
+	}
+}
