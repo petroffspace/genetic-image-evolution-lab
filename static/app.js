@@ -569,7 +569,49 @@ function showLoading(show) {
     }
     overlay.style.display = show ? 'flex' : 'none';
     if (!show) {
-        document.getElementById('loading-text').innerText = '';
+        document.getElementById('loading-text').textContent = '';
+    }
+}
+
+function updateRenderProgressUI(done, total) {
+    const safeTotal = Math.max(0, Number(total) || 0);
+    const safeDone = Math.max(0, Math.min(safeTotal || Number(done) || 0, Number(done) || 0));
+    const pct = safeTotal > 0 ? Math.min(100, Math.round((safeDone * 100) / safeTotal)) : 0;
+    const label = `Rendering: frame ${safeDone} from ${safeTotal}`;
+
+    const statusEl = document.getElementById('render-status');
+    const barEl = document.getElementById('render-bar');
+    const infoEl = document.getElementById('render-info');
+    if (statusEl) statusEl.innerText = label;
+    if (barEl) barEl.value = pct;
+    if (infoEl) infoEl.innerText = `${pct}%`;
+
+    const loadingText = document.getElementById('loading-text');
+    if (loadingText) {
+        let wrap = loadingText.querySelector('.overlay-progress');
+        if (!wrap) {
+            loadingText.textContent = '';
+            wrap = document.createElement('div');
+            wrap.className = 'overlay-progress';
+            const header = document.createElement('div');
+            header.className = 'progress-header';
+            const lblSpan = document.createElement('span');
+            lblSpan.className = 'overlay-progress-label';
+            const pctSpan = document.createElement('span');
+            pctSpan.className = 'progress-percent overlay-progress-pct';
+            header.appendChild(lblSpan);
+            header.appendChild(pctSpan);
+            const prog = document.createElement('progress');
+            prog.className = 'progress-line overlay-progress-bar';
+            prog.max = 100;
+            prog.value = 0;
+            wrap.appendChild(header);
+            wrap.appendChild(prog);
+            loadingText.appendChild(wrap);
+        }
+        wrap.querySelector('.overlay-progress-label').textContent = label;
+        wrap.querySelector('.overlay-progress-pct').textContent = `${pct}%`;
+        wrap.querySelector('.overlay-progress-bar').value = pct;
     }
 }
 
@@ -578,7 +620,8 @@ function showLoading(show) {
 // ============================================================================
 
 const FEATURE_IDS = ['transform', 'relief', 'spikes', 'chroma', 'cone',
-                     'domain_warp', 'symmetry', 'anchor_palette', 'lch_palette', 'layers', 'cellular', 'lic', 'rd'];
+                     'domain_warp', 'symmetry', 'anchor_palette', 'lch_palette', 'layers', 'cellular', 'lic', 'rd',
+                     'curl_flow', 'isolines', 'iridescence'];
 
 async function loadFeatures() {
     try {
@@ -840,15 +883,12 @@ async function renderAnimation() {
     // Show progress
     const progressEl = document.getElementById('render-progress');
     const resultEl = document.getElementById('render-result');
-    const statusEl = document.getElementById('render-status');
-    const barEl = document.getElementById('render-bar');
-    const infoEl = document.getElementById('render-info');
+    const expectedTotal = animTotalFrames();
 
     progressEl.classList.remove('hidden');
     resultEl.classList.add('hidden');
-    barEl.value = 0;
-    statusEl.innerText = 'Preparing animation...';
-    infoEl.innerText = '';
+    showLoading(true);
+    updateRenderProgressUI(0, expectedTotal);
 
     // Send render request
     const payload = {
@@ -867,8 +907,21 @@ async function renderAnimation() {
         payload.drift_dirs = randomDriftDirs(payload.source_cells.length);
     }
 
+    let pollTimer = null;
     try {
-        showLoading(true);
+        pollTimer = setInterval(async () => {
+            try {
+                const pRes = await fetch('/api/render-progress');
+                if (!pRes.ok) return;
+                const p = await pRes.json();
+                if (p.total_frames > 0) {
+                    updateRenderProgressUI(p.done_frames, p.total_frames);
+                }
+            } catch (_) {
+                // ignore transient polling errors
+            }
+        }, 120);
+
         const res = await fetch('/api/render-animation', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -876,10 +929,11 @@ async function renderAnimation() {
         });
 
         const data = await res.json();
-        showLoading(false);
-        progressEl.classList.add('hidden');
+        clearInterval(pollTimer);
+        pollTimer = null;
 
         if (res.ok && data.status === 'rendered') {
+            updateRenderProgressUI(data.total_frames, data.total_frames);
             resultEl.className = 'result-message success';
             // textContent, not innerHTML: the paths echo the user-typed
             // directory and must not be parsed as markup.
@@ -902,11 +956,13 @@ async function renderAnimation() {
             throw new Error(data.error || 'Rendering failed');
         }
     } catch (err) {
-        showLoading(false);
-        progressEl.classList.add('hidden');
         resultEl.className = 'result-message error';
         resultEl.textContent = `❌ Error:\n${err.message}`;
         console.error('Animation error:', err);
+    } finally {
+        if (pollTimer !== null) clearInterval(pollTimer);
+        showLoading(false);
+        progressEl.classList.add('hidden');
     }
 }
 

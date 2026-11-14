@@ -1,2 +1,4 @@
 sessions/
 /lab
+*.md
+!README.md

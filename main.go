@@ -386,6 +386,18 @@ type Genome struct {
 	// the structure field. Mode 0 = none.
 	RD RDSpec `json:"rd"`
 
+	// Curl optionally advects the structure field along a divergence-free
+	// 2D stream function on the periodic tile (fluid plumes, eddies). Mode 0 = none.
+	Curl CurlSpec `json:"curl"`
+
+	// Iso optionally overlays constant-width, gradient-normalized contour
+	// bands / agate veining in colorizeFloat. Mode 0 = none.
+	Iso IsoSpec `json:"iso"`
+
+	// Irid optionally adds thin-film interference chroma shifts and soft
+	// Blinn-Phong specular highlights from the surface slope. Mode 0 = none.
+	Irid IridSpec `json:"irid"`
+
 	// Seed blending: every frequency bin's random phase is rotated from
 	// Seed's realization toward SeedB's along the shortest arc, weighted
 	// by SeedBlend in [0,1]. This makes "change the seed" a continuous
@@ -866,6 +878,182 @@ func applyLic(base []float64, n int, cfg Genome) {
 	mix := clampF(cfg.Lic.Mix, 0, 1)
 	for i := range base {
 		base[i] = base[i]*(1-mix) + lic[i]*mix
+	}
+}
+
+// CurlSpec describes incompressible curl-noise streamline advection on the
+// periodic tile: a velocity field v = (-d(psi)/dy, d(psi)/dx) is derived from
+// a smooth periodic stream function psi, and the structure field is advected
+// backward along streamlines using Steps RK2 midpoint steps.
+//
+//	Mode 1: independent stream function psi (Seed+9501, cutoff Scale cycles/tile).
+//	Mode 2: self-vortex rollup where psi is the smoothed base structure field.
+type CurlSpec struct {
+	Mode     int     `json:"mode,omitempty"`     // 0=off, 1=independent stream psi, 2=self-vortex curl
+	Steps    int     `json:"steps,omitempty"`    // 2..5 RK2 semi-Lagrangian steps
+	Strength float64 `json:"strength,omitempty"` // total advection distance in tile fraction (0.012..0.055)
+	Scale    float64 `json:"scale,omitempty"`    // stream function cutoff in cycles per tile (1.5..5.0)
+	Mix      float64 `json:"mix,omitempty"`      // 0.35..0.85 blend with base field
+}
+
+func randomCurl(rng *rand.Rand) CurlSpec {
+	return CurlSpec{
+		Mode:     1 + rng.Intn(2),
+		Steps:    2 + rng.Intn(4),             // 2..5 steps
+		Strength: 0.008 + rng.Float64()*0.022, // 0.008..0.030 tile widths
+		Scale:    1.5 + rng.Float64()*3.5,     // 1.5..5.0 cycles/tile
+		Mix:      0.25 + rng.Float64()*0.40,   // 0.25..0.65
+	}
+}
+
+// applyCurlFlow advects the n x n periodic tile base along a divergence-free
+// velocity field (v7+) and blends the result back into base in place.
+func applyCurlFlow(base []float64, n int, cfg Genome) {
+	if cfg.RenderVersion < 7 || cfg.Curl.Mode <= 0 || cfg.Curl.Strength <= 0.0005 || cfg.Curl.Mix <= 0.001 {
+		return
+	}
+	m := warpSideFor(cfg)
+	scale := clampF(cfg.Curl.Scale, 1.0, 8.0)
+
+	var psi []float64
+	if cfg.Curl.Mode == 2 {
+		psi = make([]float64, m*m)
+		if n >= m && n%m == 0 {
+			k := n / m
+			inv := 1.0 / float64(k*k)
+			for y := 0; y < m; y++ {
+				for x := 0; x < m; x++ {
+					var sum float64
+					for dy := 0; dy < k; dy++ {
+						for dx := 0; dx < k; dx++ {
+							sum += base[(y*k+dy)*n+x*k+dx]
+						}
+					}
+					psi[y*m+x] = sum * inv
+				}
+			}
+		} else {
+			toN := float64(n) / float64(m)
+			for y := 0; y < m; y++ {
+				for x := 0; x < m; x++ {
+					psi[y*m+x] = samplePeriodic(base, n, float64(x)*toN, float64(y)*toN)
+				}
+			}
+		}
+		r := clampi(int(math.Round(float64(m)/(6.0*scale))), 1, maxInt(1, m/4))
+		for pass := 0; pass < 2; pass++ {
+			psi = boxBlurPeriodic(psi, m, r)
+		}
+		standardize(psi)
+	} else {
+		psi = warpNoise(cfg.Seed+9501, scale, m)
+		if cfg.motionFlow > 0 {
+			psiB := warpNoise(cfg.Seed+9502, scale, m)
+			th := 2 * math.Pi * cfg.motionTau
+			c, s := math.Cos(th), math.Sin(th)
+			for i := range psi {
+				psi[i] = psi[i]*c + psiB[i]*s
+			}
+		}
+	}
+
+	vx, vy := make([]float64, m*m), make([]float64, m*m)
+	mask := m - 1
+	var sqSum float64
+	halfM := 0.5 * float64(m)
+	for y := 0; y < m; y++ {
+		yp := (y + 1) & mask
+		ym := (y - 1) & mask
+		for x := 0; x < m; x++ {
+			xp := (x + 1) & mask
+			xm := (x - 1) & mask
+			gx := (psi[y*m+xp] - psi[y*m+xm]) * halfM
+			gy := (psi[yp*m+x] - psi[ym*m+x]) * halfM
+			vx[y*m+x], vy[y*m+x] = -gy, gx
+			sqSum += gx*gx + gy*gy
+		}
+	}
+	rms := math.Sqrt(sqSum / float64(m*m))
+	if rms > 1e-12 {
+		invRMS := 1.0 / rms
+		for i := range vx {
+			vx[i] *= invRMS
+			vy[i] *= invRMS
+		}
+	}
+
+	standardize(base)
+	steps := clampi(cfg.Curl.Steps, 1, 6)
+	totalDisp := clampF(cfg.Curl.Strength, 0, 0.08) * float64(n)
+	dt := totalDisp / float64(steps)
+	toM := float64(m) / float64(n)
+
+	adv := make([]float64, n*n)
+	parallelRows(n, func(ya, yb int) {
+		for y := ya; y < yb; y++ {
+			for x := 0; x < n; x++ {
+				px, py := float64(x), float64(y)
+				for s := 0; s < steps; s++ {
+					u0 := samplePeriodic(vx, m, px*toM, py*toM)
+					v0 := samplePeriodic(vy, m, px*toM, py*toM)
+					mx, my := px-0.5*dt*u0, py-0.5*dt*v0
+					um := samplePeriodic(vx, m, mx*toM, my*toM)
+					vm := samplePeriodic(vy, m, mx*toM, my*toM)
+					px -= dt * um
+					py -= dt * vm
+				}
+				adv[y*n+x] = samplePeriodic(base, n, px, py)
+			}
+		}
+	})
+	standardize(adv)
+	mix := clampF(cfg.Curl.Mix, 0, 1)
+	for i := range base {
+		base[i] = base[i]*(1-mix) + adv[i]*mix
+	}
+}
+
+// IsoSpec describes gradient-normalized, analytically band-limited contour
+// isolines and mineral agate banding in colorizeFloat.
+//
+//	Mode 1: smooth constant-width contour ribbons.
+//	Mode 2: crisp stepped agate veining with subtle second-harmonic rim.
+type IsoSpec struct {
+	Mode      int     `json:"mode,omitempty"`      // 0=off, 1=smooth contour ribbons, 2=agate bands with contour rim
+	Count     float64 `json:"count,omitempty"`     // 3.0..10.0 contour bands across [0, 1]
+	Sharpness float64 `json:"sharpness,omitempty"` // 0.5..2.2 band shaping
+	Mix       float64 `json:"mix,omitempty"`       // 0.15..0.48 blend into lum01
+}
+
+func randomIso(rng *rand.Rand) IsoSpec {
+	return IsoSpec{
+		Mode:      1 + rng.Intn(2),
+		Count:     2.5 + rng.Float64()*4.5,
+		Sharpness: 0.5 + rng.Float64()*1.3,
+		Mix:       0.12 + rng.Float64()*0.23,
+	}
+}
+
+// IridSpec describes thin-film interference chroma shifts and soft Blinn-Phong
+// specular highlights driven by the float luminance gradient in colorizeFloat.
+//
+//	Mode 1: pearlescent thin-film interference.
+//	Mode 2: metallic specular sheen + thin-film rim.
+type IridSpec struct {
+	Mode      int     `json:"mode,omitempty"`      // 0=off, 1=pearlescent thin-film, 2=metallic specular + rim
+	Strength  float64 `json:"strength,omitempty"`  // 0.12..0.42
+	Shininess float64 `json:"shininess,omitempty"` // 2.0..8.0 specular exponent
+	Thickness float64 `json:"thickness,omitempty"` // 1.2..3.8 optical phase multiplier
+	HuePhase  float64 `json:"hue_phase,omitempty"` // 0..1 base interference hue turn
+}
+
+func randomIrid(rng *rand.Rand) IridSpec {
+	return IridSpec{
+		Mode:      1 + rng.Intn(2),
+		Strength:  0.12 + rng.Float64()*0.30,
+		Shininess: 2.0 + rng.Float64()*6.0,
+		Thickness: 1.2 + rng.Float64()*2.6,
+		HuePhase:  rng.Float64(),
 	}
 }
 
@@ -1363,6 +1551,9 @@ func animateGenome(g Genome, m MotionSpec, tau float64) Genome {
 				g.PalD[i] = frac(g.PalD[i] + c)
 			}
 		}
+		if g.Irid.Mode > 0 {
+			g.Irid.HuePhase = frac(g.Irid.HuePhase + c)
+		}
 	}
 	if m.Drift > 0 && g.LumaRef == "" {
 		d := driftDirs[((m.DriftDir%8)+8)%8]
@@ -1432,6 +1623,15 @@ func morphGenes(g Genome, s, tau float64) Genome {
 	}
 	if g.Lic.Mode > 0 {
 		g.Lic.Length = clampF(g.Lic.Length*(1+0.2*w(15)), 1, 60)
+	}
+	if g.Curl.Mode > 0 {
+		g.Curl.Strength = clampF(g.Curl.Strength*(1+0.08*w(16)), 0.005, 0.06)
+	}
+	if g.Iso.Mode > 0 {
+		g.Iso.Mix = clampF(g.Iso.Mix+0.03*w(17), 0.05, 0.5)
+	}
+	if g.Irid.Mode > 0 {
+		g.Irid.Thickness = clampF(g.Irid.Thickness*(1+0.08*w(18)), 0.5, 5.0)
 	}
 	return g
 }
@@ -1635,6 +1835,16 @@ func randomGenome(rng *rand.Rand) Genome {
 		g.SymmetryFold = 2 + rng.Intn(7)
 		g.SymmetryMirror = rng.Float64() < 0.5
 	}
+	extRng := rand.New(rand.NewSource(g.Seed ^ 0x5A17C3E9D2B48F01))
+	if extRng.Float64() < 0.16 {
+		g.Curl = randomCurl(extRng)
+	}
+	if extRng.Float64() < 0.16 {
+		g.Iso = randomIso(extRng)
+	}
+	if extRng.Float64() < 0.18 {
+		g.Irid = randomIrid(extRng)
+	}
 	return g
 }
 
@@ -1710,6 +1920,9 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 	child.Cell = pick().Cell   // cellular field: one linked group
 	child.Lic = pick().Lic     // line integral convolution: one linked group
 	child.RD = pick().RD       // reaction-diffusion: one linked group
+	child.Curl = pick().Curl   // curl-flow advection: one linked group
+	child.Iso = pick().Iso     // contour isolines: one linked group
+	child.Irid = pick().Irid   // iridescence & specular: one linked group
 	g = pick()                 // radial symmetry
 	child.SymmetryFold, child.SymmetryMirror = g.SymmetryFold, g.SymmetryMirror
 	g = pick() // palette: one coherent set
@@ -1877,6 +2090,55 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 			child.Layer.Mode = 0
 		default:
 			child.Layer.Mode = 1 + (child.Layer.Mode+rng.Intn(2))%3 // another mode
+		}
+	}
+	if c := &child.Curl; c.Mode > 0 {
+		c.Strength = clampF(jitter(c.Strength, 0.008), 0.008, 0.065)
+		c.Scale = clampF(jitter(c.Scale, 0.4), 1.2, 6.0)
+		c.Mix = clampF(jitter(c.Mix, 0.08), 0.2, 0.9)
+		if chance(0.08) {
+			c.Steps = clampi(c.Steps+1-2*rng.Intn(2), 2, 5)
+		}
+		if chance(0.06) {
+			c.Mode = 3 - c.Mode
+		}
+	}
+	if chance(0.05) { // rare: add or drop curl-flow advection
+		if child.Curl.Mode == 0 {
+			child.Curl = randomCurl(rng)
+		} else {
+			child.Curl.Mode = 0
+		}
+	}
+	if iso := &child.Iso; iso.Mode > 0 {
+		iso.Count = clampF(jitter(iso.Count, 1.0), 2.5, 12.0)
+		iso.Sharpness = clampF(jitter(iso.Sharpness, 0.25), 0.4, 2.5)
+		iso.Mix = clampF(jitter(iso.Mix, 0.06), 0.1, 0.55)
+		if chance(0.06) {
+			iso.Mode = 3 - iso.Mode
+		}
+	}
+	if chance(0.05) { // rare: add or drop contour isolines
+		if child.Iso.Mode == 0 {
+			child.Iso = randomIso(rng)
+		} else {
+			child.Iso.Mode = 0
+		}
+	}
+	if irid := &child.Irid; irid.Mode > 0 {
+		irid.Strength = clampF(jitter(irid.Strength, 0.06), 0.08, 0.50)
+		irid.Shininess = clampF(jitter(irid.Shininess, 0.8), 1.5, 9.0)
+		irid.Thickness = clampF(jitter(irid.Thickness, 0.4), 0.8, 4.5)
+		irid.HuePhase = frac(jitter(irid.HuePhase, 0.08) + 2.0)
+		if chance(0.06) {
+			irid.Mode = 3 - irid.Mode
+		}
+	}
+	if chance(0.05) { // rare: add or drop iridescence
+		if child.Irid.Mode == 0 {
+			child.Irid = randomIrid(rng)
+		} else {
+			child.Irid.Mode = 0
 		}
 	}
 	if chance(0.05) { // rare: swap to one of the other two palette families
@@ -2925,6 +3187,9 @@ func spectralField(width, height int, rng *rand.Rand, cfg Genome) specField {
 		if cfg.RD.Mode > 0 {
 			stage("rd", func() { applyRD(canonical, padT, cfg) })
 		}
+		if cfg.RenderVersion >= 7 && cfg.Curl.Mode > 0 {
+			stage("curl", func() { applyCurlFlow(canonical, padT, cfg) })
+		}
 		if cfg.Lic.Mode > 0 {
 			stage("lic", func() { applyLic(canonical, padT, cfg) })
 		}
@@ -3255,17 +3520,49 @@ func colorizeFloat(f specField, rng *rand.Rand, cfg Genome) *image.RGBA {
 	}
 	lx, ly := math.Cos(cfg.ReliefAngle), math.Sin(cfg.ReliefAngle)
 	relief := cfg.ReliefStrength > 0.001
+	isoOn := cfg.RenderVersion >= 7 && cfg.Iso.Mode > 0 && cfg.Iso.Mix > 0.001 && cfg.Iso.Count > 0.1
+	iridOn := cfg.RenderVersion >= 7 && cfg.Irid.Mode > 0 && cfg.Irid.Strength > 0.001
+	needSlope := isoOn || iridOn
+	isoSharp := clampF(cfg.Iso.Sharpness, 0.3, 2.5)
+	isoTanhInv := 1.0 / math.Tanh(isoSharp)
+	iridThick := clampF(cfg.Irid.Thickness, 0.5, 5.0)
+	iridStr := clampF(cfg.Irid.Strength, 0, 0.55)
+	iridShine := clampF(cfg.Irid.Shininess, 1.5, 10.0)
 
 	rgba := image.NewRGBA(image.Rect(0, 0, width, height))
 	parallelRows(height, func(ya, yb int) {
 		for y := ya; y < yb; y++ {
 			for x := 0; x < width; x++ {
 				idx := y*padW + x
+				var gx, gy, gradMag, worldGrad float64
+				if needSlope {
+					x0 := maxInt(0, x-reliefSpan)
+					x1 := minInt(width-1, x+reliefSpan)
+					y0 := maxInt(0, y-reliefSpan)
+					y1 := minInt(height-1, y+reliefSpan)
+					gx = float64(lum[y*padW+x1]-lum[y*padW+x0]) / float64(maxInt(1, x1-x0))
+					gy = float64(lum[y1*padW+x]-lum[y0*padW+x]) / float64(maxInt(1, y1-y0))
+					gradMag = math.Hypot(gx, gy)
+					worldGrad = gradMag * reliefGain
+				}
 				lum01 := applyTransform(float64(lum[idx]), cfg)
 				if relief && x > reliefSpan && x < width-1-reliefSpan && y > reliefSpan && y < height-reliefSpan {
 					dxl := float64(lum[idx+reliefSpan]-lum[idx-reliefSpan]) / (2 * float64(reliefSpan))
 					dyl := float64(lum[idx+reliefSpan*padW]-lum[idx-reliefSpan*padW]) / (2 * float64(reliefSpan))
 					lum01 = clampF(lum01+cfg.ReliefStrength*reliefGain*(dxl*lx+dyl*ly), 0, 1)
+				}
+				if isoOn {
+					omega := cfg.Iso.Count * gradMag
+					aa := math.Exp(-18.0 * omega * omega)
+					sNorm := worldGrad * cfg.Iso.Count * 0.45
+					cw := 1.0 / math.Sqrt(1.0+sNorm*sNorm)
+					phase := 2.0 * math.Pi * cfg.Iso.Count * lum01
+					band := math.Tanh(isoSharp*math.Sin(phase)) * isoTanhInv
+					if cfg.Iso.Mode == 2 {
+						band = 0.75*band + 0.25*math.Sin(2*phase)*aa
+					}
+					isoMix := clampF(cfg.Iso.Mix, 0, 0.65) * aa * cw
+					lum01 = clampF(lum01+isoMix*0.18*band, 0, 1)
 				}
 				t := math.Pow(lum01, cfg.Gamma)
 				if f.chroma != nil {
@@ -3275,6 +3572,24 @@ func colorizeFloat(f specField, rng *rand.Rand, cfg Genome) *image.RGBA {
 				cf := cfg.Colorfulness
 				gray := 0.2126*r + 0.7152*g + 0.0722*b
 				r, g, b = gray+(r-gray)*cf, gray+(g-gray)*cf, gray+(b-gray)*cf
+				if iridOn {
+					ndotl := (gx*lx + gy*ly) * reliefGain
+					slopeSat := math.Tanh(worldGrad * 3.0)
+					dirSat := math.Tanh(ndotl * 3.0)
+					phi := 2.0 * math.Pi * (cfg.Irid.HuePhase + iridThick*(0.65*slopeSat+0.35*dirSat))
+					L, A, B := srgbToOKLab(clampF(r, 0, 1), clampF(g, 0, 1), clampF(b, 0, 1))
+					filmEnv := iridStr * 0.11 * (0.35 + 0.65*slopeSat)
+					A += filmEnv * math.Cos(phi)
+					B += filmEnv * math.Sin(phi)
+					specBase := math.Max(0, 0.5+0.5*dirSat)
+					spec := math.Pow(specBase, iridShine) * slopeSat
+					if cfg.Irid.Mode == 2 {
+						L = clampF(L+iridStr*0.22*spec, 0, 1)
+					} else {
+						L = clampF(L+iridStr*0.10*spec, 0, 1)
+					}
+					r, g, b = oklabToSRGB(L, A, B)
+				}
 				o := rgba.PixOffset(x, y)
 				rgba.Pix[o] = quantizeDither(r, x, y)
 				rgba.Pix[o+1] = quantizeDither(g, x, y)
@@ -5706,6 +6021,22 @@ func interpolateGenomes(genomeA, genomeB Genome, progress float64) Genome {
 		out.Lic.FlowScale = l(genomeA.Lic.FlowScale, genomeB.Lic.FlowScale)
 		out.Lic.Smooth = l(genomeA.Lic.Smooth, genomeB.Lic.Smooth)
 	}
+	if genomeA.Curl.Mode > 0 && genomeB.Curl.Mode > 0 {
+		out.Curl.Strength = l(genomeA.Curl.Strength, genomeB.Curl.Strength)
+		out.Curl.Scale = l(genomeA.Curl.Scale, genomeB.Curl.Scale)
+		out.Curl.Mix = l(genomeA.Curl.Mix, genomeB.Curl.Mix)
+	}
+	if genomeA.Iso.Mode > 0 && genomeB.Iso.Mode > 0 {
+		out.Iso.Count = l(genomeA.Iso.Count, genomeB.Iso.Count)
+		out.Iso.Sharpness = l(genomeA.Iso.Sharpness, genomeB.Iso.Sharpness)
+		out.Iso.Mix = l(genomeA.Iso.Mix, genomeB.Iso.Mix)
+	}
+	if genomeA.Irid.Mode > 0 && genomeB.Irid.Mode > 0 {
+		out.Irid.Strength = l(genomeA.Irid.Strength, genomeB.Irid.Strength)
+		out.Irid.Shininess = l(genomeA.Irid.Shininess, genomeB.Irid.Shininess)
+		out.Irid.Thickness = l(genomeA.Irid.Thickness, genomeB.Irid.Thickness)
+		out.Irid.HuePhase = lerpPhase(genomeA.Irid.HuePhase, genomeB.Irid.HuePhase, progress)
+	}
 	if genomeA.Cell.Mode > 0 && genomeB.Cell.Mode > 0 {
 		out.Cell.Jitter = l(genomeA.Cell.Jitter, genomeB.Cell.Jitter)
 		out.Cell.Mix = l(genomeA.Cell.Mix, genomeB.Cell.Mix)
@@ -6557,6 +6888,11 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	atomic.StoreInt64(&animProgress.totalFrames, int64(req.Frames))
+	atomic.StoreInt64(&animProgress.doneFrames, 0)
+	atomic.StoreInt32(&animProgress.active, 1)
+	defer atomic.StoreInt32(&animProgress.active, 0)
+
 	easeFunc := getEasingFunc(easing)
 
 	// All rendering goes through renderExactFramed: frames come out at
@@ -6586,6 +6922,7 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		processedFiles[frame] = nameFor(frame)
+		atomic.AddInt64(&animProgress.doneFrames, 1)
 		return nil
 	}
 
@@ -7060,6 +7397,33 @@ func handleRenderAnimation(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+var animProgress struct {
+	active      int32 // atomic: 1 while rendering, 0 otherwise
+	doneFrames  int64 // atomic: frames encoded so far
+	totalFrames int64 // atomic: total frames in current job
+}
+
+func handleRenderProgress(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	done := atomic.LoadInt64(&animProgress.doneFrames)
+	total := atomic.LoadInt64(&animProgress.totalFrames)
+	active := atomic.LoadInt32(&animProgress.active) != 0
+	pct := 0
+	if total > 0 {
+		pct = clampi(int(math.Round(float64(done)*100.0/float64(total))), 0, 100)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"active":       active,
+		"done_frames":  done,
+		"total_frames": total,
+		"percent":      pct,
+	})
+}
+
 // pngFast encodes every PNG the app writes (animation frames, exports,
 // saved images, grid previews) at zlib's fastest level: about 3x faster
 // than the default (130 vs 400 ms for a FullHD frame) for ~15% larger
@@ -7142,6 +7506,9 @@ func pairBridge(a, b Genome) (classicPair, structDiffers, fadeOnly bool) {
 		a.Layer.Mode != b.Layer.Mode ||
 		a.Cell.Mode != b.Cell.Mode || a.Cell.Metric != b.Cell.Metric ||
 		a.Lic.Mode != b.Lic.Mode || (a.Lic.Mode > 0 && a.Lic.Width != b.Lic.Width) ||
+		a.Curl.Mode != b.Curl.Mode || (a.Curl.Mode > 0 && a.Curl.Steps != b.Curl.Steps) ||
+		a.Iso.Mode != b.Iso.Mode ||
+		a.Irid.Mode != b.Irid.Mode ||
 		(a.Cell.Mode > 0 && a.Cell.cellCount() != b.Cell.cellCount()) ||
 		a.AnchorCount != b.AnchorCount
 	// Match-mode pairs are not phase-morphed, so any difference in their
@@ -7157,7 +7524,8 @@ func pairBridge(a, b Genome) (classicPair, structDiffers, fadeOnly bool) {
 		usesSeedExtras := func(g Genome) bool {
 			return (g.SpikeCount > 0 && g.SpikeAmp > 0.001) || g.DomainWarp > 0.001 ||
 				g.Layer.Mode == 1 || // the layer mask is derived from Seed
-				g.Lic.Mode == 2 // so is the swirl flow
+				g.Lic.Mode == 2 || // so is the swirl flow
+				g.Curl.Mode == 1 // so is the curl stream function
 		}
 		if usesSeedExtras(a) || usesSeedExtras(b) {
 			structDiffers = true
@@ -7976,6 +8344,21 @@ func diversityFeatures(st imageStats, g Genome) []float64 {
 		layered = 0.4
 	}
 	f = append(f, layered)
+	curlFlow := 0.0
+	if g.Curl.Mode > 0 {
+		curlFlow = 0.35
+	}
+	f = append(f, curlFlow)
+	isolines := 0.0
+	if g.Iso.Mode > 0 {
+		isolines = 0.35
+	}
+	f = append(f, isolines)
+	irid := 0.0
+	if g.Irid.Mode > 0 {
+		irid = 0.35
+	}
+	f = append(f, irid)
 	// Palette family, one-hot. Without it max-min picking favored the RGB
 	// cosine family, whose loud palettes sit at the edges of color space.
 	for k := 0; k < 3; k++ {
@@ -8154,37 +8537,43 @@ func seedPopulation(n int, fixed []Genome, rng *rand.Rand) []seededCell {
 // the change: applyFeatures zeroes disabled genes at creation time, so
 // existing images and saved genomes render exactly as before.
 type FeatureToggles struct {
-	Transform  bool `json:"transform"`      // nonlinear transforms (wave 1)
-	Relief     bool `json:"relief"`         // relief lighting (wave 1)
-	Spikes     bool `json:"spikes"`         // spectral spikes (wave 2)
-	Chroma     bool `json:"chroma"`         // chroma modulation (wave 2)
-	Cone       bool `json:"cone"`           // directional cone (wave 3)
-	DomainWarp bool `json:"domain_warp"`    // classic-mode warp (wave 4)
-	Symmetry   bool `json:"symmetry"`       // radial symmetry (wave 5)
-	AnchorPal  bool `json:"anchor_palette"` // anchor-point palette (wave 5)
-	LchPal     bool `json:"lch_palette"`    // OKLCH cosine palette
-	Layers     bool `json:"layers"`         // two-layer composition
-	Cellular   bool `json:"cellular"`       // cellular (Worley) field
-	Lic        bool `json:"lic"`            // line integral convolution
-	RD         bool `json:"rd"`             // reaction-diffusion
+	Transform   bool `json:"transform"`      // nonlinear transforms (wave 1)
+	Relief      bool `json:"relief"`         // relief lighting (wave 1)
+	Spikes      bool `json:"spikes"`         // spectral spikes (wave 2)
+	Chroma      bool `json:"chroma"`         // chroma modulation (wave 2)
+	Cone        bool `json:"cone"`           // directional cone (wave 3)
+	DomainWarp  bool `json:"domain_warp"`    // classic-mode warp (wave 4)
+	Symmetry    bool `json:"symmetry"`       // radial symmetry (wave 5)
+	AnchorPal   bool `json:"anchor_palette"` // anchor-point palette (wave 5)
+	LchPal      bool `json:"lch_palette"`    // OKLCH cosine palette
+	Layers      bool `json:"layers"`         // two-layer composition
+	Cellular    bool `json:"cellular"`       // cellular (Worley) field
+	Lic         bool `json:"lic"`            // line integral convolution
+	RD          bool `json:"rd"`             // reaction-diffusion
+	CurlFlow    bool `json:"curl_flow"`      // curl-noise streamline advection
+	Isolines    bool `json:"isolines"`       // constant-width contour isolines
+	Iridescence bool `json:"iridescence"`    // thin-film iridescence & specular sheen
 }
 
 var (
 	featureMu sync.RWMutex
 	features  = FeatureToggles{
-		Transform:  true,
-		Relief:     true,
-		Spikes:     true,
-		Chroma:     true,
-		Cone:       true,
-		DomainWarp: true,
-		Symmetry:   true,
-		AnchorPal:  true,
-		LchPal:     true,
-		Layers:     true,
-		Cellular:   true,
-		Lic:        true,
-		RD:         true,
+		Transform:   true,
+		Relief:      true,
+		Spikes:      true,
+		Chroma:      true,
+		Cone:        true,
+		DomainWarp:  true,
+		Symmetry:    true,
+		AnchorPal:   true,
+		LchPal:      true,
+		Layers:      true,
+		Cellular:    true,
+		Lic:         true,
+		RD:          true,
+		CurlFlow:    true,
+		Isolines:    true,
+		Iridescence: true,
 	}
 )
 
@@ -8244,6 +8633,15 @@ func applyFeatures(g *Genome) {
 	if !f.LchPal && g.PaletteMode == 2 {
 		g.PaletteMode = 0
 	}
+	if !f.CurlFlow {
+		g.Curl.Mode = 0
+	}
+	if !f.Isolines {
+		g.Iso.Mode = 0
+	}
+	if !f.Iridescence {
+		g.Irid.Mode = 0
+	}
 }
 
 func handleFeatures(w http.ResponseWriter, r *http.Request) {
@@ -8293,6 +8691,7 @@ func main() {
 	http.HandleFunc("/api/load-params", handleLoadParams)
 	http.HandleFunc("/api/upload-image", handleUploadImage)
 	http.HandleFunc("/api/render-animation", handleRenderAnimation)
+	http.HandleFunc("/api/render-progress", handleRenderProgress)
 	http.HandleFunc("/api/render-image", handleRenderImage)
 	http.HandleFunc("/api/undo", handleUndo)
 	http.HandleFunc("/api/get-genome", handleGetGenome)

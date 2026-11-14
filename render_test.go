@@ -1069,6 +1069,7 @@ func TestSymmetryNoEdgeSmear(t *testing.T) {
 		// Measure symmetry alone: LIC streaks and RD stripes are
 		// directional by design and would confound the coherence metric.
 		g.Layer.Mode, g.Cell.Mode, g.Lic.Mode, g.RD.Mode = 0, 0, 0, 0
+		g.Curl.Mode, g.Iso.Mode, g.Irid.Mode = 0, 0, 0
 		g.RenderVersion = renderVersion
 		if e := edgeCoherenceExcess(renderGridPreview(g)); e > 0.04 {
 			t.Errorf("fold %d mirror %v: edge band %.3f more directional than interior (smear)", c.fold, c.mirror, e)
@@ -2223,5 +2224,170 @@ func TestMatchModeHermitianSymmetry(t *testing.T) {
 
 	if img := renderClean(base, 64, 48); measureImage(img).contrast <= 0.01 {
 		t.Error("match-mode render with PhaseJitter produced flat image")
+	}
+}
+
+func TestCurlFlowFeature(t *testing.T) {
+	base := Genome{
+		Seed: 123, Exponent: 2.6, BandLimit: 0.45, AxisStretch: 1.0,
+		Gamma: 1.0, Colorfulness: 0.8, ConeWidth: 1.0, RenderVersion: renderVersion,
+		PalA: [3]float64{0.5, 0.5, 0.5}, PalB: [3]float64{0.5, 0.5, 0.5},
+		PalC: [3]float64{1, 1, 1}, PalD: [3]float64{0, 0.33, 0.67},
+	}
+	still := renderGridPreview(base)
+
+	for _, mode := range []int{1, 2} {
+		g := base
+		g.Curl = CurlSpec{Mode: mode, Steps: 4, Strength: 0.04, Scale: 3.0, Mix: 0.8}
+		img := renderGridPreview(g)
+		if st := measureImage(img); st.contrast <= 0.01 {
+			t.Errorf("Curl mode %d produced flat image (contrast %.4f)", mode, st.contrast)
+		}
+		if d := meanAbsDiff(still, img); d < 1.0 {
+			t.Errorf("Curl mode %d barely changed image (meanAbsDiff %.3f)", mode, d)
+		}
+
+		// Seamless loop with MotionSpec{Flow: 1}
+		m := MotionSpec{Flow: 1.0}
+		f0 := renderExactFramed(animateGenome(g, m, 0), 160, 90)
+		f1 := renderExactFramed(animateGenome(g, m, 1), 160, 90)
+		if d := meanAbsDiff(f0, f1); d > 0.01 {
+			t.Errorf("Curl mode %d Flow loop mismatch between tau=0 and tau=1: %.4f", mode, d)
+		}
+	}
+
+	defer setFeatures(getFeatures())
+	f := getFeatures()
+	f.CurlFlow = false
+	setFeatures(f)
+	g := base
+	g.Curl = CurlSpec{Mode: 1, Steps: 3, Strength: 0.03, Scale: 2.5, Mix: 0.7}
+	applyFeatures(&g)
+	if g.Curl.Mode != 0 {
+		t.Errorf("CurlFlow survived its toggle being off (mode %d)", g.Curl.Mode)
+	}
+}
+
+func TestIsolinesFeature(t *testing.T) {
+	base := Genome{
+		Seed: 321, Exponent: 2.8, BandLimit: 0.45, AxisStretch: 1.2,
+		Gamma: 1.0, Colorfulness: 0.8, ConeWidth: 1.0, RenderVersion: renderVersion,
+		PalA: [3]float64{0.5, 0.5, 0.5}, PalB: [3]float64{0.5, 0.5, 0.5},
+		PalC: [3]float64{1, 1, 1}, PalD: [3]float64{0.1, 0.3, 0.6},
+	}
+	still := renderGridPreview(base)
+
+	for _, mode := range []int{1, 2} {
+		g := base
+		g.Iso = IsoSpec{Mode: mode, Count: 8.0, Sharpness: 1.6, Mix: 0.45}
+		img := renderGridPreview(g)
+		if d := meanAbsDiff(still, img); d < 1.0 {
+			t.Errorf("Iso mode %d barely changed image (meanAbsDiff %.3f)", mode, d)
+		}
+		grad, _, ratio := grainMetrics(img)
+		if ratio >= 1.25 || grad >= 30.0 {
+			t.Errorf("Iso mode %d exceeded grain thresholds: grad=%.2f, lap/grad=%.3f", mode, grad, ratio)
+		}
+	}
+
+	defer setFeatures(getFeatures())
+	f := getFeatures()
+	f.Isolines = false
+	setFeatures(f)
+	g := base
+	g.Iso = IsoSpec{Mode: 2, Count: 6.0, Sharpness: 1.5, Mix: 0.4}
+	applyFeatures(&g)
+	if g.Iso.Mode != 0 {
+		t.Errorf("Isolines survived its toggle being off (mode %d)", g.Iso.Mode)
+	}
+}
+
+func TestIridescenceFeature(t *testing.T) {
+	base := Genome{
+		Seed: 654, Exponent: 2.7, BandLimit: 0.50, AxisStretch: 1.1,
+		Gamma: 1.0, Colorfulness: 0.85, ConeWidth: 1.0, ReliefAngle: 0.8,
+		RenderVersion: renderVersion,
+		PalA:          [3]float64{0.5, 0.5, 0.5}, PalB: [3]float64{0.5, 0.5, 0.5},
+		PalC: [3]float64{1, 1, 1}, PalD: [3]float64{0.2, 0.4, 0.7},
+	}
+	still := renderGridPreview(base)
+
+	for _, mode := range []int{1, 2} {
+		g := base
+		g.Irid = IridSpec{Mode: mode, Strength: 0.38, Shininess: 4.0, Thickness: 2.5, HuePhase: 0.25}
+		img := renderGridPreview(g)
+		if d := meanAbsDiff(still, img); d < 0.8 {
+			t.Errorf("Irid mode %d barely changed image (meanAbsDiff %.3f)", mode, d)
+		}
+
+		// Color motion shifts HuePhase smoothly and returns identically at tau=1
+		m := MotionSpec{Color: 1}
+		f0 := renderExactFramed(animateGenome(g, m, 0), 160, 90)
+		f1 := renderExactFramed(animateGenome(g, m, 1), 160, 90)
+		if d := meanAbsDiff(f0, f1); d > 0.01 {
+			t.Errorf("Irid mode %d Color loop mismatch between tau=0 and tau=1: %.4f", mode, d)
+		}
+	}
+
+	defer setFeatures(getFeatures())
+	f := getFeatures()
+	f.Iridescence = false
+	setFeatures(f)
+	g := base
+	g.Irid = IridSpec{Mode: 1, Strength: 0.3, Shininess: 3.0, Thickness: 2.0, HuePhase: 0.4}
+	applyFeatures(&g)
+	if g.Irid.Mode != 0 {
+		t.Errorf("Iridescence survived its toggle being off (mode %d)", g.Irid.Mode)
+	}
+}
+
+func TestRenderAnimationProgress(t *testing.T) {
+	recPost := httptest.NewRecorder()
+	handleRenderProgress(recPost, httptest.NewRequest("POST", "/api/render-progress", nil))
+	if recPost.Code != 405 {
+		t.Fatalf("POST /api/render-progress status = %d, want 405", recPost.Code)
+	}
+
+	state = NewAppState(t.TempDir())
+	r := rand.New(rand.NewSource(88))
+	for i := 0; i < 2; i++ {
+		g := randomGenome(r)
+		g.RD.Mode = 0
+		state.cells[i].Genome = g
+	}
+	code, errMsg, imgs := runAnimation(t, map[string]interface{}{
+		"source_cells":      []int{0, 1},
+		"hold_frames":       2,
+		"transition_frames": 3,
+		"fps":               24,
+		"width":             96,
+		"height":            54,
+		"mode":              "crossfade",
+	})
+	if code != 200 || errMsg != "" {
+		t.Fatalf("runAnimation failed: %d %s", code, errMsg)
+	}
+
+	rec := httptest.NewRecorder()
+	handleRenderProgress(rec, httptest.NewRequest("GET", "/api/render-progress", nil))
+	if rec.Code != 200 {
+		t.Fatalf("GET /api/render-progress status = %d, want 200", rec.Code)
+	}
+	var got struct {
+		Active      bool  `json:"active"`
+		DoneFrames  int64 `json:"done_frames"`
+		TotalFrames int64 `json:"total_frames"`
+		Percent     int   `json:"percent"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode progress JSON: %v", err)
+	}
+	wantTotal := int64(len(imgs))
+	if got.Active {
+		t.Errorf("expected active=false after completion, got true")
+	}
+	if got.TotalFrames != wantTotal || got.DoneFrames != wantTotal || got.Percent != 100 {
+		t.Errorf("got done=%d total=%d pct=%d, want %d/%d (100%%)",
+			got.DoneFrames, got.TotalFrames, got.Percent, wantTotal, wantTotal)
 	}
 }

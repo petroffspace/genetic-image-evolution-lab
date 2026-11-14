@@ -41,6 +41,9 @@
             <label><input type="checkbox" id="feat-cellular" checked> Cellular (Worley)</label>
             <label><input type="checkbox" id="feat-lic" checked> Brush strokes (LIC)</label>
             <label><input type="checkbox" id="feat-rd" checked> Reaction-diffusion</label>
+            <label title="Advect the structure field along divergence-free fluid streamlines (plumes, eddies, vortex rollup)"><input type="checkbox" id="feat-curl_flow" checked> Curl-flow advection</label>
+            <label title="Constant-width, gradient-normalized contour ribbons and mineral agate banding"><input type="checkbox" id="feat-isolines" checked> Contour isolines (agate)</label>
+            <label title="Surface-normal thin-film interference chroma shifts and soft specular sheen"><input type="checkbox" id="feat-iridescence" checked> Iridescent sheen</label>
         </div>
 
         <div id="grid" class="grid"></div>
@@ -197,9 +200,11 @@
         <button id="render-btn" class="btn-primary btn-large">Render PNG Sequence</button>
         
         <div id="render-progress" class="progress-container hidden">
-            <span id="render-status">Starting...</span>
-            <progress id="render-bar" value="0" max="100"></progress>
-            <span id="render-info"></span>
+            <div class="progress-header">
+                <span id="render-status">Rendering: frame 0 from 0</span>
+                <span id="render-info" class="progress-percent">0%</span>
+            </div>
+            <progress id="render-bar" class="progress-line" value="0" max="100"></progress>
         </div>
         
         <div id="render-result" class="result-message hidden"></div>
