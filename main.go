@@ -4508,27 +4508,11 @@ func renderClean(g Genome, width, height int) *image.RGBA {
 	return generateSpectralImage(width, height, rand.New(rand.NewSource(rc.Seed)), rc)
 }
 
-// renderPreviewFramed renders a genome at the grid preview's field of
-// view, supersampled 2x for a smooth, anti-aliased export. The tile is
-// sampled isotropically anchored to the canvas long side, so any
-// canvas narrower than 4:3 is first narrowed (keeping height) to match
-// the 256x192 preview's world window. Rendering that canvas at 2x
-// covers the IDENTICAL world window (wpp halves as the canvas doubles),
-// so the result can be Lanczos-downsampled back to the requested size —
-// suppressing the fine grain a near-1:1 display of the 1024-tile
-// otherwise shows. Supersampling is skipped when the doubled canvas
-// would exceed the 8192-px render budget (memory), falling back to the
-// plain render: at those sizes the field buffer alone is ~0.5 GB.
+// renderPreviewFramed renders a genome at the exact requested canvas size
+// (delegating to renderExactFramed so exports keep their full requested
+// aspect ratio and pixel dimensions without 4:3 narrowing).
 func renderPreviewFramed(g Genome, width, height int) *image.RGBA {
-	if maxW := height * 4 / 3; width > maxW {
-		width = maxW
-	}
-	ss := supersampleFactor(g, fieldTile, width, height)
-	if ss == 1 {
-		return renderClean(g, width, height)
-	}
-	big := renderClean(g, width*ss, height*ss)
-	return downsampleImage(big, width, height)
+	return renderExactFramed(g, width, height)
 }
 
 // renderExactFramed renders a genome at EXACTLY the requested canvas size,
@@ -7774,15 +7758,68 @@ func handleToggleLock(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"locked": locked})
 }
 
+// exportResPresets mirrors Animation Studio's RES_PRESETS mapping from
+// (aspect, quality) to exact WxH pixel dimensions within the 8192-px cap.
+var exportResPresets = map[string]map[string][2]int{
+	"4:3":  {"sd": {640, 480}, "hd": {1024, 768}, "fullhd": {1440, 1080}, "4k": {2880, 2160}, "8k": {5760, 4320}},
+	"16:9": {"sd": {640, 360}, "hd": {1280, 720}, "fullhd": {1920, 1080}, "4k": {3840, 2160}, "8k": {7680, 4320}},
+	"21:9": {"sd": {1120, 480}, "hd": {1680, 720}, "fullhd": {2520, 1080}, "4k": {5040, 2160}, "8k": {8064, 3456}},
+	"1:1":  {"sd": {480, 480}, "hd": {720, 720}, "fullhd": {1080, 1080}, "4k": {2160, 2160}, "8k": {4320, 4320}},
+	"9:16": {"sd": {360, 640}, "hd": {720, 1280}, "fullhd": {1080, 1920}, "4k": {2160, 3840}, "8k": {4320, 7680}},
+}
+
+// resolveExportDimensions resolves image export dimensions from an explicit
+// width/height pair, an (aspect, quality) Animation Studio preset, or a legacy
+// "WxH" size string. Returns ok=false when no valid dimensions within [1, 8192]
+// are supplied or when conflicting inputs disagree.
+func resolveExportDimensions(size, aspect, quality string, width, height int) (int, int, bool) {
+	a := strings.TrimSpace(aspect)
+	q := strings.ToLower(strings.TrimSpace(quality))
+	if a != "" || q != "" {
+		qualities, ok := exportResPresets[a]
+		if !ok {
+			return 0, 0, false
+		}
+		dims, ok := qualities[q]
+		if !ok {
+			return 0, 0, false
+		}
+		if (width != 0 || height != 0) && (width != dims[0] || height != dims[1]) {
+			return 0, 0, false
+		}
+		return dims[0], dims[1], true
+	}
+	if width != 0 || height != 0 {
+		if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
+			return 0, 0, false
+		}
+		return width, height, true
+	}
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(size)), "x")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	w, errW := strconv.Atoi(strings.TrimSpace(parts[0]))
+	h, errH := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errW != nil || errH != nil || w <= 0 || h <= 0 || w > 8192 || h > 8192 {
+		return 0, 0, false
+	}
+	return w, h, true
+}
+
 func handleSaveImage(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		jsonError(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var req struct {
-		Index int    `json:"index"`
-		Size  string `json:"size"`
-		Dir   string `json:"dir"`
+		Index   int    `json:"index"`
+		Size    string `json:"size"`
+		Aspect  string `json:"aspect"`
+		Quality string `json:"quality"`
+		Width   int    `json:"width"`
+		Height  int    `json:"height"`
+		Dir     string `json:"dir"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
@@ -7791,20 +7828,14 @@ func handleSaveImage(w http.ResponseWriter, r *http.Request) {
 	if !validCell(w, req.Index) {
 		return
 	}
+	width, height, ok := resolveExportDimensions(req.Size, req.Aspect, req.Quality, req.Width, req.Height)
+	if !ok {
+		jsonError(w, "Invalid dimensions or aspect/quality preset", http.StatusBadRequest)
+		return
+	}
 	state.mu.RLock()
 	g := state.cells[req.Index].Genome
 	state.mu.RUnlock()
-	parts := strings.Split(strings.ToLower(strings.TrimSpace(req.Size)), "x")
-	if len(parts) != 2 {
-		jsonError(w, "Invalid size format", http.StatusBadRequest)
-		return
-	}
-	width, _ := strconv.Atoi(parts[0])
-	height, _ := strconv.Atoi(parts[1])
-	if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
-		jsonError(w, "Invalid dimensions", http.StatusBadRequest)
-		return
-	}
 	saveDir := req.Dir
 	if saveDir == "" {
 		saveDir = state.genomeDir
@@ -7814,7 +7845,7 @@ func handleSaveImage(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Directory does not exist", http.StatusBadRequest)
 		return
 	}
-	img := renderPreviewFramed(g, width, height)
+	img := renderExactFramed(g, width, height)
 	timestamp := time.Now().Format("20060102_150405")
 	filename := filepath.Join(saveDir, fmt.Sprintf("image_%04d_%dx%d_%s.png", req.Index, img.Bounds().Dx(), img.Bounds().Dy(), timestamp))
 	file, err := os.Create(filename)
@@ -7843,8 +7874,12 @@ func handleRenderImage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Index int    `json:"index"`
-		Size  string `json:"size"`
+		Index   int    `json:"index"`
+		Size    string `json:"size"`
+		Aspect  string `json:"aspect"`
+		Quality string `json:"quality"`
+		Width   int    `json:"width"`
+		Height  int    `json:"height"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "Invalid request: "+err.Error(), http.StatusBadRequest)
@@ -7854,22 +7889,16 @@ func handleRenderImage(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "Invalid cell index", http.StatusBadRequest)
 		return
 	}
-	parts := strings.Split(strings.ToLower(strings.TrimSpace(req.Size)), "x")
-	if len(parts) != 2 {
-		jsonError(w, "Invalid size format (use WxH)", http.StatusBadRequest)
-		return
-	}
-	width, _ := strconv.Atoi(parts[0])
-	height, _ := strconv.Atoi(parts[1])
-	if width <= 0 || height <= 0 || width > 8192 || height > 8192 {
-		jsonError(w, "Invalid dimensions", http.StatusBadRequest)
+	width, height, ok := resolveExportDimensions(req.Size, req.Aspect, req.Quality, req.Width, req.Height)
+	if !ok {
+		jsonError(w, "Invalid dimensions or aspect/quality preset", http.StatusBadRequest)
 		return
 	}
 	state.mu.RLock()
 	g := state.cells[req.Index].Genome
 	state.mu.RUnlock()
 
-	img := renderPreviewFramed(g, width, height)
+	img := renderExactFramed(g, width, height)
 
 	// Encode before writing headers so a failure can still be reported
 	// (once the PNG body has started, the status code is already sent).
@@ -7878,8 +7907,6 @@ func handleRenderImage(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "PNG encode failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	// The canvas may have been narrowed to the preview's 4:3 field of view;
-	// tell the client the real size so its filename is accurate.
 	w.Header().Set("Content-Type", "image/png")
 	w.Header().Set("X-Image-Width", strconv.Itoa(img.Bounds().Dx()))
 	w.Header().Set("X-Image-Height", strconv.Itoa(img.Bounds().Dy()))

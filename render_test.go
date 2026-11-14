@@ -2391,3 +2391,157 @@ func TestRenderAnimationProgress(t *testing.T) {
 			got.DoneFrames, got.TotalFrames, got.Percent, wantTotal, wantTotal)
 	}
 }
+
+func TestRenderImagePixelPerfect(t *testing.T) {
+	// Verify every Animation Studio preset in exportResPresets resolves cleanly
+	// and rejects mismatched or out-of-range inputs.
+	expectedPresets := []struct {
+		aspect, quality string
+		w, h            int
+	}{
+		{"4:3", "sd", 640, 480},
+		{"4:3", "hd", 1024, 768},
+		{"4:3", "fullhd", 1440, 1080},
+		{"4:3", "4k", 2880, 2160},
+		{"4:3", "8k", 5760, 4320},
+		{"16:9", "sd", 640, 360},
+		{"16:9", "hd", 1280, 720},
+		{"16:9", "fullhd", 1920, 1080},
+		{"16:9", "4k", 3840, 2160},
+		{"16:9", "8k", 7680, 4320},
+		{"21:9", "sd", 1120, 480},
+		{"21:9", "hd", 1680, 720},
+		{"21:9", "fullhd", 2520, 1080},
+		{"21:9", "4k", 5040, 2160},
+		{"21:9", "8k", 8064, 3456},
+		{"1:1", "sd", 480, 480},
+		{"1:1", "hd", 720, 720},
+		{"1:1", "fullhd", 1080, 1080},
+		{"1:1", "4k", 2160, 2160},
+		{"1:1", "8k", 4320, 4320},
+		{"9:16", "sd", 360, 640},
+		{"9:16", "hd", 720, 1280},
+		{"9:16", "fullhd", 1080, 1920},
+		{"9:16", "4k", 2160, 3840},
+		{"9:16", "8k", 4320, 7680},
+	}
+	for _, tc := range expectedPresets {
+		w, h, ok := resolveExportDimensions("", tc.aspect, tc.quality, 0, 0)
+		if !ok || w != tc.w || h != tc.h {
+			t.Fatalf("resolveExportDimensions(%q, %q) = (%d,%d,%v), want (%d,%d,true)",
+				tc.aspect, tc.quality, w, h, ok, tc.w, tc.h)
+		}
+	}
+	if _, _, ok := resolveExportDimensions("", "16:9", "fullhd", 1440, 1080); ok {
+		t.Fatalf("expected mismatched explicit dimensions against preset to fail")
+	}
+	if _, _, ok := resolveExportDimensions("", "16:10", "fullhd", 0, 0); ok {
+		t.Fatalf("expected unknown aspect preset to fail")
+	}
+
+	tmpDir := t.TempDir()
+	state = NewAppState(tmpDir)
+	rng := rand.New(rand.NewSource(99))
+	g := randomGenome(rng)
+	g.RD.Mode = 0
+	state.cells[0].Genome = g
+
+	postRender := func(payload map[string]interface{}) (int, image.Config, string, string) {
+		b, _ := json.Marshal(payload)
+		rec := httptest.NewRecorder()
+		handleRenderImage(rec, httptest.NewRequest("POST", "/api/render-image", bytes.NewReader(b)))
+		if rec.Code != 200 {
+			return rec.Code, image.Config{}, "", ""
+		}
+		cfg, err := png.DecodeConfig(bytes.NewReader(rec.Body.Bytes()))
+		if err != nil {
+			t.Fatalf("decode rendered PNG config: %v", err)
+		}
+		return rec.Code, cfg, rec.Header().Get("X-Image-Width"), rec.Header().Get("X-Image-Height")
+	}
+
+	// Primary regression check: 16:9 FullHD must render exact 1920x1080 (never 1440x1080).
+	code, cfg, hdrW, hdrH := postRender(map[string]interface{}{
+		"index":   0,
+		"aspect":  "16:9",
+		"quality": "fullhd",
+		"width":   1920,
+		"height":  1080,
+		"size":    "1920x1080",
+	})
+	if code != 200 || cfg.Width != 1920 || cfg.Height != 1080 || hdrW != "1920" || hdrH != "1080" {
+		t.Fatalf("16:9 fullhd render got code=%d png=%dx%d headers=%sx%s, want 1920x1080",
+			code, cfg.Width, cfg.Height, hdrW, hdrH)
+	}
+
+	// Check every aspect preset via aspect+quality alone (SD for speed).
+	for _, tc := range []struct {
+		aspect string
+		w, h   int
+	}{
+		{"4:3", 640, 480},
+		{"16:9", 640, 360},
+		{"21:9", 1120, 480},
+		{"1:1", 480, 480},
+		{"9:16", 360, 640},
+	} {
+		code, cfg, hdrW, hdrH := postRender(map[string]interface{}{
+			"index":   0,
+			"aspect":  tc.aspect,
+			"quality": "sd",
+		})
+		if code != 200 || cfg.Width != tc.w || cfg.Height != tc.h ||
+			hdrW != fmt.Sprintf("%d", tc.w) || hdrH != fmt.Sprintf("%d", tc.h) {
+			t.Fatalf("aspect %s sd got code=%d png=%dx%d headers=%sx%s, want %dx%d",
+				tc.aspect, code, cfg.Width, cfg.Height, hdrW, hdrH, tc.w, tc.h)
+		}
+	}
+
+	// Legacy WxH wide size should also be exact (no 4:3 clamp).
+	if code, cfg, hdrW, hdrH := postRender(map[string]interface{}{"index": 0, "size": "320x180"}); code != 200 ||
+		cfg.Width != 320 || cfg.Height != 180 || hdrW != "320" || hdrH != "180" {
+		t.Fatalf("legacy 320x180 got code=%d png=%dx%d headers=%sx%s, want 320x180",
+			code, cfg.Width, cfg.Height, hdrW, hdrH)
+	}
+
+	// Invalid preset must return 400.
+	if code, _, _, _ := postRender(map[string]interface{}{"index": 0, "aspect": "bad", "quality": "sd"}); code != 400 {
+		t.Fatalf("invalid preset returned code=%d, want 400", code)
+	}
+
+	// /api/save-image must also write an exact-dimension PNG to disk.
+	saveReq, _ := json.Marshal(map[string]interface{}{
+		"index":   0,
+		"aspect":  "21:9",
+		"quality": "sd",
+		"dir":     tmpDir,
+	})
+	recSave := httptest.NewRecorder()
+	handleSaveImage(recSave, httptest.NewRequest("POST", "/api/save-image", bytes.NewReader(saveReq)))
+	if recSave.Code != 200 {
+		t.Fatalf("handleSaveImage code = %d: %s", recSave.Code, recSave.Body.String())
+	}
+	var saveResp struct {
+		Status string `json:"status"`
+		Path   string `json:"path"`
+	}
+	if err := json.Unmarshal(recSave.Body.Bytes(), &saveResp); err != nil {
+		t.Fatalf("decode save response: %v", err)
+	}
+	raw, err := os.ReadFile(saveResp.Path)
+	if err != nil {
+		t.Fatalf("read saved PNG %s: %v", saveResp.Path, err)
+	}
+	savedImg, err := png.Decode(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatalf("decode saved PNG: %v", err)
+	}
+	if savedImg.Bounds().Dx() != 1120 || savedImg.Bounds().Dy() != 480 {
+		t.Fatalf("saved PNG dimensions = %dx%d, want 1120x480", savedImg.Bounds().Dx(), savedImg.Bounds().Dy())
+	}
+	wantPrefix := "image_0000_1120x480_"
+	base := filepath.Base(saveResp.Path)
+	if len(base) < len(wantPrefix) || base[:len(wantPrefix)] != wantPrefix {
+		t.Fatalf("saved filename = %q, want prefix %q", base, wantPrefix)
+	}
+}

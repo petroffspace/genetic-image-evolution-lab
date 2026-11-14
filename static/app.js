@@ -1,5 +1,16 @@
 const TOTAL_CELLS = 9;
 
+// Exact WxH presets per aspect/quality shared by image save and Animation Studio.
+// All values stay within the server's 8192-px cap; 21:9 is 7:3 so 8K is 8064x3456
+// rather than 10080x4320.
+const RES_PRESETS = {
+    '4:3':  { 'sd': [640, 480],  'hd': [1024, 768],  'fullhd': [1440, 1080], '4k': [2880, 2160],  '8k': [5760, 4320] },
+    '16:9': { 'sd': [640, 360],  'hd': [1280, 720],  'fullhd': [1920, 1080], '4k': [3840, 2160],  '8k': [7680, 4320] },
+    '21:9': { 'sd': [1120, 480], 'hd': [1680, 720],  'fullhd': [2520, 1080], '4k': [5040, 2160],  '8k': [8064, 3456] },
+    '1:1':  { 'sd': [480, 480],  'hd': [720, 720],   'fullhd': [1080, 1080], '4k': [2160, 2160],  '8k': [4320, 4320] },
+    '9:16': { 'sd': [360, 640],  'hd': [720, 1280],  'fullhd': [1080, 1920], '4k': [2160, 3840],  '8k': [4320, 7680] },
+};
+
 // Cache of the last fetched grid so saveParams can build the JSON client-side.
 let gridData = [];
 
@@ -133,10 +144,20 @@ function renderGrid(cells) {
         previewBtn.title = 'Preview live motion (Animation Studio settings)';
         previewBtn.onclick = () => togglePreview(i, img, previewBtn);
 
+        const topLeft = document.createElement('div');
+        topLeft.className = 'cell-top-left';
+
+        const numLabel = document.createElement('span');
+        numLabel.className = 'cell-number';
+        numLabel.innerText = String(i);
+        topLeft.appendChild(numLabel);
+
+        const badge = strengthBadge(cell.strength);
+        if (badge) topLeft.appendChild(badge);
+
         cellDiv.appendChild(img);
         cellDiv.appendChild(previewBtn);
-        const badge = strengthBadge(cell.strength);
-        if (badge) cellDiv.appendChild(badge);
+        cellDiv.appendChild(topLeft);
         cellDiv.appendChild(btnContainer);
 
         grid.appendChild(cellDiv);
@@ -320,27 +341,93 @@ async function toggleLock(index) {
     await fetchGrid();
 }
 
-async function saveImage(index) {
-    const size = prompt('Enter export size (WxH):', '1920x1080');
-    if (!size) return;
+function updateSaveImageSizeInfo() {
+    const aspect = document.getElementById('save-img-aspect').value;
+    const quality = document.getElementById('save-img-quality').value;
+    const preset = RES_PRESETS[aspect] && RES_PRESETS[aspect][quality];
+    const info = document.getElementById('save-img-size-info');
+    if (info) {
+        info.innerText = preset ? `${preset[0]}x${preset[1]}` : 'invalid';
+    }
+    return preset;
+}
 
+function promptSaveImageOptions(index) {
+    const modal = document.getElementById('save-image-modal');
+    const titleEl = document.getElementById('save-img-title');
+    const aspectEl = document.getElementById('save-img-aspect');
+    const qualityEl = document.getElementById('save-img-quality');
+    const cancelBtn = document.getElementById('save-img-cancel');
+    const confirmBtn = document.getElementById('save-img-confirm');
+
+    if (titleEl) titleEl.innerText = `🖼️ Save Cell ${index} Image`;
+    updateSaveImageSizeInfo();
+    modal.classList.remove('hidden');
+
+    return new Promise(resolve => {
+        const cleanup = () => {
+            modal.classList.add('hidden');
+            aspectEl.removeEventListener('change', updateSaveImageSizeInfo);
+            qualityEl.removeEventListener('change', updateSaveImageSizeInfo);
+            cancelBtn.removeEventListener('click', onCancel);
+            confirmBtn.removeEventListener('click', onConfirm);
+            modal.removeEventListener('click', onBackdrop);
+            document.removeEventListener('keydown', onKeyDown);
+        };
+        const onCancel = () => {
+            cleanup();
+            resolve(null);
+        };
+        const onConfirm = () => {
+            const aspect = aspectEl.value;
+            const quality = qualityEl.value;
+            const preset = RES_PRESETS[aspect] && RES_PRESETS[aspect][quality];
+            cleanup();
+            resolve(preset ? { aspect, quality, width: preset[0], height: preset[1] } : null);
+        };
+        const onBackdrop = e => {
+            if (e.target === modal) onCancel();
+        };
+        const onKeyDown = e => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                onCancel();
+            } else if (e.key === 'Enter' && document.activeElement !== cancelBtn) {
+                e.preventDefault();
+                onConfirm();
+            }
+        };
+
+        aspectEl.addEventListener('change', updateSaveImageSizeInfo);
+        qualityEl.addEventListener('change', updateSaveImageSizeInfo);
+        cancelBtn.addEventListener('click', onCancel);
+        confirmBtn.addEventListener('click', onConfirm);
+        modal.addEventListener('click', onBackdrop);
+        document.addEventListener('keydown', onKeyDown);
+        confirmBtn.focus();
+    });
+}
+
+async function saveImage(index) {
+    const choice = await promptSaveImageOptions(index);
+    if (!choice) return;
+
+    const { aspect, quality, width, height } = choice;
+    const size = `${width}x${height}`;
     showLoading(true);
     try {
         const res = await fetch('/api/render-image', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ index, size })
+            body: JSON.stringify({ index, aspect, quality, width, height, size })
         });
         if (!res.ok) {
             const data = await res.json().catch(() => ({}));
             throw new Error(data.error || `HTTP ${res.status}`);
         }
         const blob = await res.blob();
-        // The server may narrow wide sizes to the preview's 4:3 view, so
-        // name the file after the size actually rendered.
-        let [w, h] = size.trim().toLowerCase().split('x');
-        w = res.headers.get('X-Image-Width') || w;
-        h = res.headers.get('X-Image-Height') || h;
+        const w = res.headers.get('X-Image-Width') || String(width);
+        const h = res.headers.get('X-Image-Height') || String(height);
         const name = `image_${String(index).padStart(4, '0')}_${w}x${h}_${fileTimestamp()}.png`;
         await saveBlobLocally(blob, name);
     } catch (err) {
@@ -671,17 +758,6 @@ fetchGrid();
 // ============================================================================
 // ANIMATION STUDIO
 // ============================================================================
-
-// Exact WxH presets per aspect/quality. All values chosen so every side
-// stays within the server's 8192-px cap. 21:9 is exactly 7:3; its 8K entry
-// is 8064x3456 because a true 7:3 at 8K (10080x4320) would exceed 8192.
-const RES_PRESETS = {
-    '4:3':  { 'sd': [640, 480],  'hd': [1024, 768],  'fullhd': [1440, 1080], '4k': [2880, 2160],  '8k': [5760, 4320] },
-    '16:9': { 'sd': [640, 360],  'hd': [1280, 720],  'fullhd': [1920, 1080], '4k': [3840, 2160],  '8k': [7680, 4320] },
-    '21:9': { 'sd': [1120, 480], 'hd': [1680, 720],  'fullhd': [2520, 1080], '4k': [5040, 2160],  '8k': [8064, 3456] },
-    '1:1':  { 'sd': [480, 480],  'hd': [720, 720],   'fullhd': [1080, 1080], '4k': [2160, 2160],  '8k': [4320, 4320] },
-    '9:16': { 'sd': [360, 640],  'hd': [720, 1280],  'fullhd': [1080, 1920], '4k': [2160, 3840],  '8k': [4320, 7680] },
-};
 
 // Ordered keyframe cells for the animation. Two cells is the default; up
 // to MAX_ANIM_SOURCES unique cells (the whole grid) can be chained, each

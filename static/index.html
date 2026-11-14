@@ -210,6 +210,37 @@
         <div id="render-result" class="result-message hidden"></div>
     </div>
 
+    <div id="save-image-modal" class="modal-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="save-img-title">
+        <div class="modal-dialog">
+            <h3 id="save-img-title">🖼️ Save Cell Image</h3>
+            <div class="form-row">
+                <label for="save-img-aspect">Aspect Ratio:</label>
+                <select id="save-img-aspect">
+                    <option value="4:3">4:3 (classic)</option>
+                    <option value="16:9" selected>16:9 (widescreen)</option>
+                    <option value="21:9">21:9 (cinematic)</option>
+                    <option value="1:1">1:1 (square)</option>
+                    <option value="9:16">9:16 (vertical)</option>
+                </select>
+            </div>
+            <div class="form-row">
+                <label for="save-img-quality">Quality:</label>
+                <select id="save-img-quality">
+                    <option value="sd">SD</option>
+                    <option value="hd">HD</option>
+                    <option value="fullhd" selected>FullHD</option>
+                    <option value="4k">4K</option>
+                    <option value="8k">8K</option>
+                </select>
+                <span id="save-img-size-info">1920x1080</span>
+            </div>
+            <div class="modal-actions">
+                <button id="save-img-cancel" type="button" class="btn">Cancel</button>
+                <button id="save-img-confirm" type="button" class="btn-primary">Save Image</button>
+            </div>
+        </div>
+    </div>
+
     <script src="/static/app.js"></script>
 
 </body>
