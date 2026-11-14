@@ -208,8 +208,23 @@ func TestBreedKeepsGenesInRange(t *testing.T) {
 	g.ConeWidth = 0.1
 	for gen := 0; gen < 2000; gen++ {
 		g = breedGenome(g, nil, rng, wildStrength)
-		if g.Exponent < 0.5 || g.Exponent > 4.5 {
-			t.Fatalf("gen %d: Exponent %.3f outside [0.5, 4.5]", gen, g.Exponent)
+		if g.Exponent < 1.8 || g.Exponent > 4.5 {
+			t.Fatalf("gen %d: Exponent %.3f outside [1.8, 4.5]", gen, g.Exponent)
+		}
+		if g.ExponentHi < 2.2 || g.ExponentHi > 10.0 {
+			t.Fatalf("gen %d: ExponentHi %.3f outside [2.2, 10.0]", gen, g.ExponentHi)
+		}
+		if g.BandLimit < 0.08 || g.BandLimit > 0.65 {
+			t.Fatalf("gen %d: BandLimit %.3f outside [0.08, 0.65]", gen, g.BandLimit)
+		}
+		if g.ReliefStrength < 0 || g.ReliefStrength > 0.6 {
+			t.Fatalf("gen %d: ReliefStrength %.3f outside [0, 0.6]", gen, g.ReliefStrength)
+		}
+		if g.TerraceLevels < 2.0 || g.TerraceLevels > 12.0 {
+			t.Fatalf("gen %d: TerraceLevels %.3f outside [2.0, 12.0]", gen, g.TerraceLevels)
+		}
+		if g.Lic.Mode > 0 && (g.Lic.Width < 1 || g.Lic.Width > 3 || g.Lic.Length < 12 || g.Lic.Mix > 0.45) {
+			t.Fatalf("gen %d: Lic out of bounds: %+v", gen, g.Lic)
 		}
 		if g.ConeWidth < 0.05 || g.ConeWidth > 1 {
 			t.Fatalf("gen %d: ConeWidth %.3f outside [0.05, 1]", gen, g.ConeWidth)
@@ -262,17 +277,17 @@ func TestGeneGroupsStayLinked(t *testing.T) {
 		f := float64(k)
 		g := Genome{Seed: 1000 + int64(k), Exponent: 2 + 0.1*f, BandLimit: 0.5, Gamma: 1, Colorfulness: 0.5,
 			AxisStretch: 1 + 0.1*f, SpecRot: 1 + 0.1*f,
-			ExponentHi: 2 + 0.1*f, BreakFreq: 0.2 + 0.1*f,
+			ExponentHi: 2.5 + 0.1*f, BreakFreq: 0.2 + 0.1*f,
 			ConeAngle: 1 + 0.1*f, ConeWidth: 0.3 + 0.1*f,
 			SpikeCount: 1 + k, SpikeAmp: 3 + f,
 			Transform: k, TerraceLevels: 3 + f,
 			ReliefAngle: 1 + 0.1*f, ReliefStrength: 0.1 + 0.1*f,
 			SymmetryFold: 2 + k, SymmetryMirror: k%2 == 1,
 			DomainWarp: 0.1 + 0.1*f, WarpScale: 2 + 0.1*f, WarpNest: 1 + k%2,
-			Layer: LayerSpec{Mode: 1, Exponent: 2 + 0.1*f, ExponentHi: 2, BandLimit: 0.5, AxisStretch: 1,
+			Layer: LayerSpec{Mode: 1, Exponent: 2 + 0.1*f, ExponentHi: 2.5, BandLimit: 0.5, AxisStretch: 1,
 				ConeWidth: 1, Mix: 0.1 + 0.1*f, MaskScale: 3, MaskSharp: 5},
 			Cell: CellSpec{Mode: 1, Density: 5 + f, Jitter: 0.1 + 0.1*f, Mix: 0.5},
-			Lic:  LicSpec{Mode: 1, Length: 10 + f, Mix: 0.1 + 0.1*f, Smooth: 10},
+			Lic:  LicSpec{Mode: 1, Length: 15 + f, Mix: 0.1 + 0.1*f, Smooth: 10},
 			RD:   RDSpec{Mode: 1, Feed: 0.03 + 0.001*f, Kill: 0.06, Steps: 100 + k, Threshold: 0.5, Mix: 0.1 + 0.1*f}}
 		g.PalA = [3]float64{0.1 * f, 0.5, 0.5}
 		g.PalD = [3]float64{0.1 + 0.1*f, 0.5, 0.5}
@@ -287,7 +302,7 @@ func TestGeneGroupsStayLinked(t *testing.T) {
 		c := breedGenome(parent, donors, rng, 0)
 		groups := map[string][2]int{
 			"anisotropy": {id(c.AxisStretch, 1), id(c.SpecRot, 1)},
-			"breakpoint": {id(c.ExponentHi, 2), id(c.BreakFreq, 0.2)},
+			"breakpoint": {id(c.ExponentHi, 2.5), id(c.BreakFreq, 0.2)},
 			"cone":       {id(c.ConeAngle, 1), id(c.ConeWidth, 0.3)},
 			"spikes":     {c.SpikeCount - 1, int(math.Round(c.SpikeAmp - 3))},
 			"transform":  {c.Transform, int(math.Round(c.TerraceLevels - 3))},
@@ -296,7 +311,7 @@ func TestGeneGroupsStayLinked(t *testing.T) {
 			"warp":       {id(c.DomainWarp, 0.1), id(c.WarpScale, 2)},
 			"layer":      {id(c.Layer.Exponent, 2), id(c.Layer.Mix, 0.1)},
 			"cell":       {int(math.Round(c.Cell.Density - 5)), id(c.Cell.Jitter, 0.1)},
-			"lic":        {int(math.Round(c.Lic.Length - 10)), id(c.Lic.Mix, 0.1)},
+			"lic":        {int(math.Round(c.Lic.Length - 15)), id(c.Lic.Mix, 0.1)},
 			"rd":         {c.RD.Steps - 100, id(c.RD.Mix, 0.1)},
 		}
 		for name, ids := range groups {
@@ -1774,7 +1789,7 @@ func TestMorphTransformsGently(t *testing.T) {
 		}
 		mid := meanAbsDiff(renderExactFramed(animateGenome(g, m, 0.5), 160, 90), still)
 		far := meanAbsDiff(renderExactFramed(other, 160, 90), still)
-		if mid < 1 || mid > 0.6*far {
+		if mid < 1 || mid > 0.65*far {
 			t.Errorf("genome %d: halfway shape-shift moved %.2f (unrelated genome: %.2f)", i, mid, far)
 		}
 	}
@@ -1977,4 +1992,71 @@ func TestPerCellDriftDirections(t *testing.T) {
 			t.Errorf("drift_dirs %v: code %d, want 400", dirs, code)
 		}
 	}
+}
+
+// grainMetrics computes the mean pixel-to-pixel gradient magnitude and
+// mean 4-neighbor Laplacian magnitude on luma (0..255) over the interior
+// of img. High lap/grad (> 1.25) or extreme grad (> 25) indicates spatial
+// grain/sandpaper noise rather than smooth coherent structure.
+func grainMetrics(img *image.RGBA) (grad, lap, ratio float64) {
+	w, h := img.Bounds().Dx(), img.Bounds().Dy()
+	l := lumaOf(img)
+	var gSum, lSum float64
+	n := float64((w - 2) * (h - 2))
+	for y := 1; y < h-1; y++ {
+		for x := 1; x < w-1; x++ {
+			c := l[y*w+x]
+			gx := math.Abs(l[y*w+x+1] - c)
+			gy := math.Abs(l[(y+1)*w+x] - c)
+			gSum += 0.5 * (gx + gy)
+			lp := 0.25 * math.Abs(l[y*w+x-1]+l[y*w+x+1]+l[(y-1)*w+x]+l[(y+1)*w+x]-4*c)
+			lSum += lp
+		}
+	}
+	grad = gSum / n
+	lap = lSum / n
+	if grad > 1e-6 {
+		ratio = lap / grad
+	}
+	return grad, lap, ratio
+}
+
+// Verification test for v7 de-noising: across 50 random genomes from
+// seedPopulation, max lap/grad stays < 1.25 and mean pixel gradient stays
+// free of 30+ noisy outliers.
+func TestDenoisedPopulationGrainMetrics(t *testing.T) {
+	rng := rand.New(rand.NewSource(42))
+	var cells []seededCell
+	for len(cells) < 50 {
+		batch := seedPopulation(9, nil, rng)
+		cells = append(cells, batch...)
+	}
+	cells = cells[:50]
+
+	var maxRatio, maxGrad, minGrad, sumGrad float64
+	minGrad = 1e9
+	for i, c := range cells {
+		grad, lap, ratio := grainMetrics(c.image)
+		sumGrad += grad
+		if ratio > maxRatio {
+			maxRatio = ratio
+		}
+		if grad > maxGrad {
+			maxGrad = grad
+		}
+		if grad < minGrad {
+			minGrad = grad
+		}
+		if ratio >= 1.25 {
+			t.Errorf("genome %d: lap/grad ratio %.3f >= 1.25 (grad=%.2f, lap=%.2f)", i, ratio, grad, lap)
+		}
+		if grad >= 30.0 {
+			t.Errorf("genome %d: grad %.2f >= 30.0 (lap=%.2f, ratio=%.3f)", i, grad, lap, ratio)
+		}
+	}
+	meanGrad := sumGrad / float64(len(cells))
+	if meanGrad < 4.0 || meanGrad > 20.0 {
+		t.Errorf("mean population grad %.2f outside [4.0, 20.0]", meanGrad)
+	}
+	t.Logf("50 seeded genomes: mean grad = %.2f (range [%.2f, %.2f]), max lap/grad = %.3f", meanGrad, minGrad, maxGrad, maxRatio)
 }

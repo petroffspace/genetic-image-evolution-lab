@@ -460,7 +460,10 @@ type Genome struct {
 //	   shared per-bin geometry and ONE complex inverse FFT for both real
 //	   fields. Mathematically the same fields; floating-point rounding
 //	   differs (~1e-16), hence a version: older genomes stay byte-exact.
-const renderVersion = 6
+//	7: de-noising: steeper BandLimit roll-off, smooth chroma exponents,
+//	   LIC stroke width floor and cross-streamline smoothing, wider relief
+//	   gradient span, and softer symmetric terrace transitions.
+const renderVersion = 7
 
 // RDSpec describes Gray-Scott reaction-diffusion on the synthesis tile:
 //
@@ -637,17 +640,15 @@ type LicSpec struct {
 func randomLic(rng *rand.Rand) LicSpec {
 	l := LicSpec{
 		Mode:      1 + rng.Intn(2),
-		Length:    8 + rng.Float64()*24,
-		Mix:       0.2 + rng.Float64()*0.4,
+		Length:    14 + rng.Float64()*26,
+		Mix:       0.15 + rng.Float64()*0.25,
 		FlowScale: 1.5 + rng.Float64()*4.5,
 		Smooth:    8 + rng.Float64()*32,
 	}
 	switch r := rng.Float64(); {
-	case r < 0.3:
-		l.Width = 0
-	case r < 0.65:
+	case r < 0.45:
 		l.Width = 1
-	case r < 0.9:
+	case r < 0.85:
 		l.Width = 2
 	default:
 		l.Width = 3
@@ -668,7 +669,11 @@ func licTile(base []float64, n int, cfg Genome) []float64 {
 	// Noise: white noise on an nN x nN grid per tile (nN = 512 >> Width:
 	// the stroke width, defined in tile units), blended between seeds (and
 	// toward an animation partner); LIC output is restandardized afterward.
-	nN := 512 >> clampi(l.Width, 0, 3)
+	minWidth := 0
+	if cfg.RenderVersion >= 7 {
+		minWidth = 1
+	}
+	nN := 512 >> clampi(l.Width, minWidth, 3)
 	toN := float64(nN) / float64(m) // LIC pixels -> noise cells
 	noiseOf := func(p phaseSource) []float64 {
 		out := make([]float64, nN*nN)
@@ -737,6 +742,9 @@ func licTile(base []float64, n int, cfg Genome) []float64 {
 			}
 		}
 	})
+	if cfg.RenderVersion >= 7 {
+		lic = boxBlurPeriodic(lic, m, 1)
+	}
 
 	// Upsample to the tile and standardize.
 	out := make([]float64, n*n)
@@ -1134,10 +1142,10 @@ type LayerSpec struct {
 func randomLayer(rng *rand.Rand) LayerSpec {
 	l := LayerSpec{
 		Mode:        1 + rng.Intn(3),
-		Exponent:    1.5 + rng.Float64()*2.0,
-		ExponentHi:  1.5 + rng.Float64()*2.0,
+		Exponent:    1.8 + rng.Float64()*1.8,
+		ExponentHi:  2.4 + rng.Float64()*2.0,
 		BreakFreq:   0.15 + rng.Float64()*0.5,
-		BandLimit:   0.3 + rng.Float64()*0.6,
+		BandLimit:   0.2 + rng.Float64()*0.45,
 		AxisStretch: 0.5 + rng.Float64()*1.5,
 		SpecRot:     rng.Float64() * 2 * math.Pi,
 		ConeAngle:   rng.Float64() * 2 * math.Pi,
@@ -1374,9 +1382,9 @@ func morphWave(seed int64, k int, tau float64) float64 {
 // on/off) are never crossed.
 func morphGenes(g Genome, s, tau float64) Genome {
 	w := func(k int) float64 { return s * morphWave(g.Seed, k, tau) }
-	g.Exponent = clampF(g.Exponent+0.25*w(0), 0.5, 10)
+	g.Exponent = clampF(g.Exponent+0.25*w(0), math.Min(1.8, g.Exponent), 10)
 	if g.BreakFreq > 0.001 {
-		g.ExponentHi = clampF(g.ExponentHi+0.25*w(1), 0.5, 10)
+		g.ExponentHi = clampF(g.ExponentHi+0.25*w(1), math.Min(2.2, g.ExponentHi), 10)
 	}
 	if g.AxisStretch > 0 {
 		g.AxisStretch = clampF(g.AxisStretch*math.Exp(0.15*w(2)), 0.25, 4)
@@ -1386,7 +1394,7 @@ func morphGenes(g Genome, s, tau float64) Genome {
 		g.ConeAngle += 0.25 * w(4)
 	}
 	if g.BandLimit > 0 {
-		g.BandLimit = clampF(g.BandLimit*math.Exp(0.15*w(5)), 0.01, 1)
+		g.BandLimit = clampF(g.BandLimit*math.Exp(0.15*w(5)), 0.08, math.Max(0.65, g.BandLimit))
 	}
 	if g.DomainWarp > 0.001 {
 		g.DomainWarp = clampF(g.DomainWarp*(1+0.35*w(6)), 0.001, 0.5)
@@ -1401,7 +1409,7 @@ func morphGenes(g Genome, s, tau float64) Genome {
 		g.ChromaStrength = clampF(g.ChromaStrength*(1+0.25*w(9)), 0.002, 0.8)
 	}
 	if g.Layer.Mode > 0 {
-		g.Layer.Exponent = clampF(g.Layer.Exponent+0.25*w(10), 0.5, 10)
+		g.Layer.Exponent = clampF(g.Layer.Exponent+0.25*w(10), math.Min(1.8, g.Layer.Exponent), 10)
 		g.Layer.Mix = clampF(g.Layer.Mix+0.12*w(11), 0, 1)
 		g.Layer.MaskBias = clampF(g.Layer.MaskBias+0.15*w(12), -1, 1)
 	}
@@ -1445,7 +1453,8 @@ func morphPhase(seed int64, x, y int, t morphTrig) float64 {
 // sign per bin so the motion boils instead of sliding as a wave. Integer
 // turns make the loop seamless.
 func flowTurns(x, y int, f, strength float64) float64 {
-	k := math.Round(strength * math.Sqrt(f/4))
+	effF := math.Min(f, 36.0) // cap spin rate above 36 cycles/tile
+	k := math.Round(strength * math.Sqrt(effF/4))
 	if cellHash(1, x, y, 9) < 0.5 {
 		k = -k
 	}
@@ -1473,6 +1482,15 @@ func triShift(t, s float64) float64 {
 type phaseSource struct {
 	seed, seedB int64
 	blend       float64
+}
+
+// zoom is the match-mode reference zoom; 0 (unset, as uploads store it)
+// means the full frame, 1.
+func (g Genome) zoom() float64 {
+	if g.Zoom <= 0.01 {
+		return 1.0
+	}
+	return g.Zoom
 }
 
 func (g Genome) phases() phaseSource {
@@ -1543,16 +1561,16 @@ func randomPaletteGenes(rng *rand.Rand) (a, b, c, d [3]float64) {
 func randomGenome(rng *rand.Rand) Genome {
 	g := Genome{
 		Seed:           rng.Int63(),
-		Exponent:       1.5 + rng.Float64()*2.0,
-		BandLimit:      0.3 + rng.Float64()*0.6,
+		Exponent:       1.8 + rng.Float64()*1.8,
+		BandLimit:      0.2 + rng.Float64()*0.45,
 		AxisStretch:    0.5 + rng.Float64()*1.5,
 		Gamma:          0.5 + rng.Float64()*1.5,
 		Colorfulness:   0.4 + rng.Float64()*0.6,
 		Transform:      rng.Intn(4),
-		TerraceLevels:  3.0 + rng.Float64()*12.0,
+		TerraceLevels:  3.0 + rng.Float64()*9.0,
 		ReliefAngle:    rng.Float64() * 2.0 * math.Pi,
-		ReliefStrength: rng.Float64() * rng.Float64() * 1.2, // skewed toward subtle
-		ExponentHi:     1.5 + rng.Float64()*2.0,
+		ReliefStrength: rng.Float64() * rng.Float64() * 0.5, // skewed toward subtle
+		ExponentHi:     2.4 + rng.Float64()*2.0,
 		BreakFreq:      0.15 + rng.Float64()*0.5,
 		SpikeCount:     rng.Intn(5), // 0..4 spikes, 0 = classic
 		SpikeAmp:       2.0 + rng.Float64()*14.0,
@@ -1730,16 +1748,16 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 		return v + (rng.Float64()*2-1)*amt*strength
 	}
 	// Capped: unbounded, the random walk drifted toward ever-smoother blobs.
-	child.Exponent = clampF(jitter(child.Exponent, 0.3), 0.5, 4.5)
-	child.BandLimit = clampF(jitter(child.BandLimit, 0.1), 0.01, 1.0)
+	child.Exponent = clampF(jitter(child.Exponent, 0.3), 1.8, 4.5)
+	child.BandLimit = clampF(jitter(child.BandLimit, 0.1), 0.08, 0.65)
 	child.AxisStretch = clampF(jitter(child.AxisStretch, 0.15), 0.25, 4.0)
 	child.Gamma = clampF(jitter(child.Gamma, 0.15), 0.3, 3.0)
 	child.Colorfulness = clampF(jitter(child.Colorfulness, 0.1), 0.0, 1.0)
-	child.ExponentHi = clampF(jitter(child.ExponentHi, 0.3), 0.5, 10.0)
+	child.ExponentHi = clampF(jitter(child.ExponentHi, 0.3), 2.2, 10.0)
 	child.BreakFreq = clampF(jitter(child.BreakFreq, 0.08), 0.0, 0.9)
-	child.TerraceLevels = clampF(jitter(child.TerraceLevels, 1.5), 2.0, 24.0)
+	child.TerraceLevels = clampF(jitter(child.TerraceLevels, 1.5), 2.0, 12.0)
 	child.ReliefAngle = math.Mod(jitter(child.ReliefAngle, 0.3)+2.0*math.Pi, 2.0*math.Pi)
-	child.ReliefStrength = clampF(jitter(child.ReliefStrength, 0.12), 0.0, 2.0)
+	child.ReliefStrength = clampF(jitter(child.ReliefStrength, 0.12), 0.0, 0.6)
 	if chance(0.12) {
 		child.Transform = rng.Intn(4)
 	}
@@ -1790,15 +1808,15 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 		}
 	}
 	if l := &child.Lic; l.Mode > 0 {
-		l.Length = clampF(l.Length*math.Exp((rng.Float64()*2-1)*0.15*strength), 2, 60)
-		l.Mix = clampF(jitter(l.Mix, 0.08), 0, 1)
+		l.Length = clampF(l.Length*math.Exp((rng.Float64()*2-1)*0.15*strength), 12, 60)
+		l.Mix = clampF(jitter(l.Mix, 0.08), 0, 0.45)
 		l.FlowScale = clampF(jitter(l.FlowScale, 0.4), 1, 10)
 		l.Smooth = clampF(jitter(l.Smooth, 1), 1, 40)
 		if chance(0.06) {
 			l.Mode = 3 - l.Mode // contour <-> swirl
 		}
 		if chance(0.08) {
-			l.Width = clampi(l.Width+1-2*rng.Intn(2), 0, 3) // one step finer or coarser
+			l.Width = clampi(l.Width+1-2*rng.Intn(2), 1, 3) // one step finer or coarser
 		}
 	}
 	if chance(0.05) { // rare: add or drop the streaks
@@ -1827,10 +1845,10 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 		}
 	}
 	if l := &child.Layer; l.Mode > 0 {
-		l.Exponent = clampF(jitter(l.Exponent, 0.3), 0.5, 4.5)
-		l.ExponentHi = clampF(jitter(l.ExponentHi, 0.3), 0.5, 10.0)
+		l.Exponent = clampF(jitter(l.Exponent, 0.3), 1.8, 4.5)
+		l.ExponentHi = clampF(jitter(l.ExponentHi, 0.3), 2.2, 10.0)
 		l.BreakFreq = clampF(jitter(l.BreakFreq, 0.08), 0.0, 0.9)
-		l.BandLimit = clampF(jitter(l.BandLimit, 0.1), 0.01, 1.0)
+		l.BandLimit = clampF(jitter(l.BandLimit, 0.1), 0.08, 0.65)
 		l.AxisStretch = clampF(jitter(l.AxisStretch, 0.15), 0.25, 4.0)
 		l.SpecRot = math.Mod(jitter(l.SpecRot, 0.4)+2*math.Pi, 2*math.Pi)
 		l.ConeAngle = math.Mod(jitter(l.ConeAngle, 0.4)+2*math.Pi, 2*math.Pi)
@@ -1918,7 +1936,7 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 		child.Structure = clampF(jitter(child.Structure, 0.30), 0.0, 1.0)
 		child.Warp = clampF(jitter(child.Warp, 0.12), 0.0, 0.5)
 		child.PhaseJitter = clampF(jitter(child.PhaseJitter, 0.15), 0.0, 1.2)
-		child.Zoom = clampF(jitter(child.Zoom, 0.08), 0.9, 2.2)
+		child.Zoom = clampF(jitter(child.zoom(), 0.08), 0.9, 2.2)
 		child.Rot = math.Mod(jitter(child.Rot, 0.10)+3*math.Pi, 2*math.Pi) - math.Pi
 		child.CenterX = clampF(jitter(child.CenterX, 0.04), -0.25, 0.25)
 		child.CenterY = clampF(jitter(child.CenterY, 0.04), -0.25, 0.25)
@@ -1937,9 +1955,9 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 	if strength >= wildStrength || chance(0.15) {
 		switch rng.Intn(8) {
 		case 0:
-			child.Exponent = 1.5 + rng.Float64()*2.0
+			child.Exponent = 1.8 + rng.Float64()*1.8
 		case 1:
-			child.BandLimit = 0.2 + rng.Float64()*0.7
+			child.BandLimit = 0.15 + rng.Float64()*0.5
 		case 2:
 			child.AxisStretch = 0.5 + rng.Float64()*2.0
 		case 3:
@@ -1949,7 +1967,7 @@ func breedGenome(parent Genome, donors []Genome, rng *rand.Rand, strength float6
 			child.PalA, child.PalB, child.PalC, child.PalD = p.A, p.B, p.C, p.D
 		case 5:
 			child.Transform = rng.Intn(4)
-			child.TerraceLevels = 3.0 + rng.Float64()*12.0
+			child.TerraceLevels = 3.0 + rng.Float64()*9.0
 		case 6: // fresh palette within the current family
 			switch child.PaletteMode {
 			case 1:
@@ -2225,7 +2243,12 @@ func applyTransform(t float64, cfg Genome) float64 {
 		base := math.Floor(scaled)
 		frac := scaled - base
 		// narrow smooth transition between bands keeps edges soft but defined
-		edge := smoothstep01((frac - 0.5) / 0.2)
+		var edge float64
+		if cfg.RenderVersion >= 7 {
+			edge = smoothstep01((frac-0.5)/0.35 + 0.5)
+		} else {
+			edge = smoothstep01((frac - 0.5) / 0.2)
+		}
 		return (base + edge) / (levels - 1.0)
 	}
 	return t
@@ -2367,7 +2390,11 @@ func synthChannel(padW, padH int, rng *rand.Rand, cfg Genome) []float64 {
 				maxFreq := float64(refHalf)
 				cutoff := maxFreq * cfg.BandLimit
 				if f > cutoff {
-					falloff := math.Exp(-((f - cutoff) * (f - cutoff)) / (2 * cutoff * cutoff))
+					denom := 2 * cutoff * cutoff
+					if cfg.RenderVersion >= 7 {
+						denom = 0.5 * cutoff * cutoff
+					}
+					falloff := math.Exp(-((f - cutoff) * (f - cutoff)) / denom)
 					amp *= falloff
 				}
 			}
@@ -2551,7 +2578,11 @@ func synthPair(padW, padH int, rngA *rand.Rand, cfgA Genome, rngB *rand.Rand, cf
 			if cfg.BandLimit > 0 {
 				cutoff := float64(refHalf) * cfg.BandLimit
 				if f > cutoff {
-					falloff, hasFalloff = math.Exp(-((f-cutoff)*(f-cutoff))/(2*cutoff*cutoff)), true
+					denom := 2 * cutoff * cutoff
+					if cfg.RenderVersion >= 7 {
+						denom = 0.5 * cutoff * cutoff
+					}
+					falloff, hasFalloff = math.Exp(-((f-cutoff)*(f-cutoff))/denom), true
 				}
 			}
 			cone, hasCone := 1.0, false
@@ -2722,7 +2753,13 @@ func spectralField(width, height int, rng *rand.Rand, cfg Genome) specField {
 	chromaCfg := func() Genome {
 		chCfg := cfg
 		chCfg.Transform = 0
-		chCfg.BreakFreq = 0
+		if chCfg.RenderVersion >= 7 {
+			chCfg.Exponent = math.Max(cfg.Exponent, 2.8)
+			chCfg.BreakFreq = cfg.BreakFreq
+			chCfg.ExponentHi = math.Max(cfg.ExponentHi, 3.2)
+		} else {
+			chCfg.BreakFreq = 0
+		}
 		chCfg.ReliefStrength = 0
 		chCfg.MutationRate = 0
 		chCfg.MutationPower = 0
@@ -3118,6 +3155,9 @@ func colorizeFloat(f specField, rng *rand.Rand, cfg Genome) *image.RGBA {
 	// noise for reliefGain to amplify.
 	reliefGain := float64(maxInt(width, height)) / 256.0
 	reliefSpan := maxInt(int(reliefGain+0.5), 1)
+	if cfg.RenderVersion >= 7 {
+		reliefSpan = maxInt(int(reliefGain*1.5+0.5), 2)
+	}
 	lx, ly := math.Cos(cfg.ReliefAngle), math.Sin(cfg.ReliefAngle)
 	relief := cfg.ReliefStrength > 0.001
 
@@ -4778,10 +4818,7 @@ func synthMatchChannel(width, height int, cfg Genome) []float64 {
 		data[y] = make([]complex128, padSrcW)
 	}
 
-	zoom := cfg.Zoom
-	if zoom <= 0.01 {
-		zoom = 1.0
-	}
+	zoom := cfg.zoom()
 	cosR, sinR := math.Cos(-cfg.Rot), math.Sin(-cfg.Rot)
 	s := math.Min(float64(lw), float64(lh))
 	fcx := float64(lw)/2.0 + cfg.CenterX*float64(lw)
@@ -5484,56 +5521,60 @@ func lerpPhase(a, b, t float64) float64 {
 func interpolateGenomes(genomeA, genomeB Genome, progress float64) Genome {
 	out := genomeA
 
-	// lerp-with-clamp for scalar genes.
-	l := func(a, b, lo, hi float64) float64 {
-		return clampF(a+(b-a)*progress, lo, hi)
+	// lerp for scalar genes, bounded by the two endpoints so overshoot
+	// easings stay in range. Fixed gene ranges are NOT imposed: they
+	// rewrote valid endpoint values (reverse-engineered palettes with
+	// negative amplitudes, MutationRate 0, unset genes stored as 0) and
+	// made the first transition frame jump.
+	l := func(a, b float64) float64 {
+		return clampF(a+(b-a)*progress, math.Min(a, b), math.Max(a, b))
 	}
 
-	out.Exponent = l(genomeA.Exponent, genomeB.Exponent, 0.5, 10.0)
-	out.BandLimit = l(genomeA.BandLimit, genomeB.BandLimit, 0.01, 1.0)
-	out.AxisStretch = l(genomeA.AxisStretch, genomeB.AxisStretch, 0.25, 4.0)
-	out.Gamma = l(genomeA.Gamma, genomeB.Gamma, 0.3, 3.0)
-	out.Colorfulness = l(genomeA.Colorfulness, genomeB.Colorfulness, 0.0, 1.0)
-	out.MutationRate = l(genomeA.MutationRate, genomeB.MutationRate, 0.0001, 0.1)
-	out.MutationPower = l(genomeA.MutationPower, genomeB.MutationPower, 1.0, 100.0)
-	out.TerraceLevels = l(genomeA.TerraceLevels, genomeB.TerraceLevels, 2.0, 24.0)
-	out.ReliefStrength = l(genomeA.ReliefStrength, genomeB.ReliefStrength, 0.0, 2.0)
-	out.ExponentHi = l(genomeA.ExponentHi, genomeB.ExponentHi, 0.5, 10.0)
-	out.BreakFreq = l(genomeA.BreakFreq, genomeB.BreakFreq, 0.0, 0.9)
-	out.SpikeAmp = l(genomeA.SpikeAmp, genomeB.SpikeAmp, 0.0, 20.0)
-	out.ChromaStrength = l(genomeA.ChromaStrength, genomeB.ChromaStrength, 0.0, 0.8)
-	out.ConeWidth = l(genomeA.ConeWidth, genomeB.ConeWidth, 0.0, 1.0)
-	out.DomainWarp = l(genomeA.DomainWarp, genomeB.DomainWarp, 0.0, 0.5)
-	out.WarpScale = l(genomeA.WarpScale, genomeB.WarpScale, 0.0, 10.0)
+	out.Exponent = l(genomeA.Exponent, genomeB.Exponent)
+	out.BandLimit = l(genomeA.BandLimit, genomeB.BandLimit)
+	out.AxisStretch = l(genomeA.AxisStretch, genomeB.AxisStretch)
+	out.Gamma = l(genomeA.Gamma, genomeB.Gamma)
+	out.Colorfulness = l(genomeA.Colorfulness, genomeB.Colorfulness)
+	out.MutationRate = l(genomeA.MutationRate, genomeB.MutationRate)
+	out.MutationPower = l(genomeA.MutationPower, genomeB.MutationPower)
+	out.TerraceLevels = l(genomeA.TerraceLevels, genomeB.TerraceLevels)
+	out.ReliefStrength = l(genomeA.ReliefStrength, genomeB.ReliefStrength)
+	out.ExponentHi = l(genomeA.ExponentHi, genomeB.ExponentHi)
+	out.BreakFreq = l(genomeA.BreakFreq, genomeB.BreakFreq)
+	out.SpikeAmp = l(genomeA.SpikeAmp, genomeB.SpikeAmp)
+	out.ChromaStrength = l(genomeA.ChromaStrength, genomeB.ChromaStrength)
+	out.ConeWidth = l(genomeA.ConeWidth, genomeB.ConeWidth)
+	out.DomainWarp = l(genomeA.DomainWarp, genomeB.DomainWarp)
+	out.WarpScale = l(genomeA.WarpScale, genomeB.WarpScale)
 	// Layer: continuous genes lerp only when both cells are layered (Mode
 	// itself stays A's and is bridged by the end-of-segment crossfade).
 	// Cellular: jitter and mix lerp when both cells are cellular; points
 	// move via the phase morph; mode, metric and cell count stay A's and
 	// are bridged by the end-of-segment crossfade.
 	if genomeA.Lic.Mode > 0 && genomeB.Lic.Mode > 0 {
-		out.Lic.Length = l(genomeA.Lic.Length, genomeB.Lic.Length, 1, 60)
-		out.Lic.Mix = l(genomeA.Lic.Mix, genomeB.Lic.Mix, 0, 1)
-		out.Lic.FlowScale = l(genomeA.Lic.FlowScale, genomeB.Lic.FlowScale, 0, 10)
-		out.Lic.Smooth = l(genomeA.Lic.Smooth, genomeB.Lic.Smooth, 1, 40)
+		out.Lic.Length = l(genomeA.Lic.Length, genomeB.Lic.Length)
+		out.Lic.Mix = l(genomeA.Lic.Mix, genomeB.Lic.Mix)
+		out.Lic.FlowScale = l(genomeA.Lic.FlowScale, genomeB.Lic.FlowScale)
+		out.Lic.Smooth = l(genomeA.Lic.Smooth, genomeB.Lic.Smooth)
 	}
 	if genomeA.Cell.Mode > 0 && genomeB.Cell.Mode > 0 {
-		out.Cell.Jitter = l(genomeA.Cell.Jitter, genomeB.Cell.Jitter, 0, 1)
-		out.Cell.Mix = l(genomeA.Cell.Mix, genomeB.Cell.Mix, 0, 1)
+		out.Cell.Jitter = l(genomeA.Cell.Jitter, genomeB.Cell.Jitter)
+		out.Cell.Mix = l(genomeA.Cell.Mix, genomeB.Cell.Mix)
 	}
 	if genomeA.Layer.Mode > 0 && genomeB.Layer.Mode > 0 {
 		la, lb := genomeA.Layer, genomeB.Layer
-		out.Layer.Exponent = l(la.Exponent, lb.Exponent, 0.5, 10)
-		out.Layer.ExponentHi = l(la.ExponentHi, lb.ExponentHi, 0.5, 10)
-		out.Layer.BreakFreq = l(la.BreakFreq, lb.BreakFreq, 0, 0.9)
-		out.Layer.BandLimit = l(la.BandLimit, lb.BandLimit, 0.01, 1)
-		out.Layer.AxisStretch = l(la.AxisStretch, lb.AxisStretch, 0.25, 4)
+		out.Layer.Exponent = l(la.Exponent, lb.Exponent)
+		out.Layer.ExponentHi = l(la.ExponentHi, lb.ExponentHi)
+		out.Layer.BreakFreq = l(la.BreakFreq, lb.BreakFreq)
+		out.Layer.BandLimit = l(la.BandLimit, lb.BandLimit)
+		out.Layer.AxisStretch = l(la.AxisStretch, lb.AxisStretch)
 		out.Layer.SpecRot = lerpAngle(la.SpecRot, lb.SpecRot, progress)
 		out.Layer.ConeAngle = lerpAngle(la.ConeAngle, lb.ConeAngle, progress)
-		out.Layer.ConeWidth = l(la.ConeWidth, lb.ConeWidth, 0, 1)
-		out.Layer.Mix = l(la.Mix, lb.Mix, 0, 1)
-		out.Layer.MaskScale = l(la.MaskScale, lb.MaskScale, 0, 8)
-		out.Layer.MaskSharp = l(la.MaskSharp, lb.MaskSharp, 0, 40)
-		out.Layer.MaskBias = l(la.MaskBias, lb.MaskBias, -1, 1)
+		out.Layer.ConeWidth = l(la.ConeWidth, lb.ConeWidth)
+		out.Layer.Mix = l(la.Mix, lb.Mix)
+		out.Layer.MaskScale = l(la.MaskScale, lb.MaskScale)
+		out.Layer.MaskSharp = l(la.MaskSharp, lb.MaskSharp)
+		out.Layer.MaskBias = l(la.MaskBias, lb.MaskBias)
 	}
 
 	// Angular genes: shortest-arc interpolation, result wrapped to [0, 2*pi).
@@ -5541,12 +5582,11 @@ func interpolateGenomes(genomeA, genomeB Genome, progress float64) Genome {
 	out.SpecRot = math.Mod(lerpAngle(genomeA.SpecRot, genomeB.SpecRot, progress)+2*math.Pi, 2*math.Pi)
 	out.ConeAngle = math.Mod(lerpAngle(genomeA.ConeAngle, genomeB.ConeAngle, progress)+2*math.Pi, 2*math.Pi)
 
-	// Cosine palette: vectors lerp and clamp (the renderer tolerates the
-	// full range, this is belt-and-braces), phases wrap.
+	// Cosine palette: vectors lerp, phases wrap.
 	for ch := 0; ch < 3; ch++ {
-		out.PalA[ch] = clampF(genomeA.PalA[ch]+(genomeB.PalA[ch]-genomeA.PalA[ch])*progress, 0.0, 2.0)
-		out.PalB[ch] = clampF(genomeA.PalB[ch]+(genomeB.PalB[ch]-genomeA.PalB[ch])*progress, 0.0, 2.0)
-		out.PalC[ch] = clampF(genomeA.PalC[ch]+(genomeB.PalC[ch]-genomeA.PalC[ch])*progress, 0.0, 2.0)
+		out.PalA[ch] = l(genomeA.PalA[ch], genomeB.PalA[ch])
+		out.PalB[ch] = l(genomeA.PalB[ch], genomeB.PalB[ch])
+		out.PalC[ch] = l(genomeA.PalC[ch], genomeB.PalC[ch])
 		out.PalD[ch] = lerpPhase(genomeA.PalD[ch], genomeB.PalD[ch], progress)
 	}
 
@@ -5555,13 +5595,12 @@ func interpolateGenomes(genomeA, genomeB Genome, progress float64) Genome {
 
 	// OKLCH palette: magnitudes lerp, phases and base hue wrap the short way.
 	la, lb := genomeA.Lch, genomeB.Lch
-	lp := func(a, b float64) float64 { return a + (b-a)*progress }
 	out.Lch = LchPalette{
-		L0: lp(la.L0, lb.L0), LAmp: lp(la.LAmp, lb.LAmp), LFreq: lp(la.LFreq, lb.LFreq),
+		L0: l(la.L0, lb.L0), LAmp: l(la.LAmp, lb.LAmp), LFreq: l(la.LFreq, lb.LFreq),
 		LPhase: lerpPhase(la.LPhase, lb.LPhase, progress),
-		C0:     lp(la.C0, lb.C0), CAmp: lp(la.CAmp, lb.CAmp), CFreq: lp(la.CFreq, lb.CFreq),
+		C0:     l(la.C0, lb.C0), CAmp: l(la.CAmp, lb.CAmp), CFreq: l(la.CFreq, lb.CFreq),
 		CPhase: lerpPhase(la.CPhase, lb.CPhase, progress),
-		H0:     lerpPhase(la.H0, lb.H0, progress), HSpan: lp(la.HSpan, lb.HSpan),
+		H0:     lerpPhase(la.H0, lb.H0, progress), HSpan: l(la.HSpan, lb.HSpan),
 	}
 
 	// Match-mode structure genes. The copy above already guarantees
@@ -5569,14 +5608,14 @@ func interpolateGenomes(genomeA, genomeB Genome, progress float64) Genome {
 	// they describe the SAME reference, otherwise two different photos
 	// would be averaged geometrically.
 	if out.LumaRef != "" && genomeA.LumaRef == genomeB.LumaRef {
-		out.PhaseMix = l(genomeA.PhaseMix, genomeB.PhaseMix, 0.0, 1.0)
-		out.PhaseJitter = l(genomeA.PhaseJitter, genomeB.PhaseJitter, 0.0, 1.2)
-		out.Zoom = l(genomeA.Zoom, genomeB.Zoom, 0.9, 2.2)
+		out.PhaseMix = l(genomeA.PhaseMix, genomeB.PhaseMix)
+		out.PhaseJitter = l(genomeA.PhaseJitter, genomeB.PhaseJitter)
+		out.Zoom = l(genomeA.zoom(), genomeB.zoom())
 		out.Rot = math.Mod(lerpAngle(genomeA.Rot, genomeB.Rot, progress)+3*math.Pi, 2*math.Pi) - math.Pi
-		out.CenterX = l(genomeA.CenterX, genomeB.CenterX, -0.25, 0.25)
-		out.CenterY = l(genomeA.CenterY, genomeB.CenterY, -0.25, 0.25)
-		out.Structure = l(genomeA.Structure, genomeB.Structure, 0.0, 1.0)
-		out.Warp = l(genomeA.Warp, genomeB.Warp, 0.0, 0.5)
+		out.CenterX = l(genomeA.CenterX, genomeB.CenterX)
+		out.CenterY = l(genomeA.CenterY, genomeB.CenterY)
+		out.Structure = l(genomeA.Structure, genomeB.Structure)
+		out.Warp = l(genomeA.Warp, genomeB.Warp)
 	}
 
 	// Deliberately kept from A (see doc comment): Seed, Transform,
@@ -7646,6 +7685,9 @@ func imageQuality(st imageStats) float64 {
 	q *= clampF(st.entropy/4, 0.5, 1.25)  // few distinct colors
 	q *= 1 - math.Max(0, st.dominant-0.4) // one color floods the frame
 	q *= clampF(st.detail/0.03, 0.5, 1)   // featureless blur
+	if st.detail > 0.08 {
+		q *= clampF(1.0-(st.detail-0.08)/0.06, 0.04, 1.0) // high-frequency grain penalty
+	}
 	return q
 }
 
